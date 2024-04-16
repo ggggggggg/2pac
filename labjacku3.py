@@ -1,6 +1,8 @@
 import qcodes
 import u3
 import time
+from qcodes.validators import Enum, Numbers
+
 
 
 class LabjackU3(qcodes.Instrument):
@@ -10,20 +12,31 @@ class LabjackU3(qcodes.Instrument):
 
         self.add_parameter("relay",
                            set_cmd=self.set_relay,
-                           val_mapping={"CONTROL":"CONTROL", "RAMP":"RAMP", "UNKNOWN":"UNKNOWN"},
+                           vals=Enum("CONTROL", "RAMP", "UNKNOWN"),
                            initial_value="UNKNOWN",
                            )
-        
         self.add_parameter("kepco_voltage",
                            get_cmd=self.get_kepco_voltage,
+                           vals=Numbers(-20,20),
                            unit="V")
         self.add_parameter("kepco_current",
                     get_cmd=self.get_kepco_current,
+                    vals = Numbers(-10,10),
                     unit="A")
-        
-        self.add_parameter("pot_hs",
-                           set_cmd=self.pot_hs_control,
+        self.add_parameter("heatswitch_pot",
+                           set_cmd=self._pot_hs_control,
                            initial_value="UNKNOWN",
+                           vals = Enum("OPEN","CLOSED","UNKNOWN")
+                           )
+        self.add_parameter("heatswitch_adr",
+                           set_cmd=self._adr_hs_control,
+                           initial_value="UNKNOWN",
+                           vals = Enum("OPEN","CLOSED","UNKNOWN")
+                           )
+        self.add_parameter("heatswitch_charcoal",
+                           set_cmd=self._charcoal_hs_control,
+                           initial_value="UNKNOWN",
+                           vals = Enum("OPEN","CLOSED","UNKNOWN")
                            )
         
     def get_idn(self) -> dict[str, str | int | None]:
@@ -33,7 +46,7 @@ class LabjackU3(qcodes.Instrument):
         return self.lj.getAIN(0)*2
 
     def get_kepco_current(self):
-        return self.lj.getAIN(2)*2
+        return self.lj.getAIN(2)
 
     def set_relay(self, x):
         if x == "CONTROL":
@@ -84,18 +97,35 @@ class LabjackU3(qcodes.Instrument):
         time.sleep(sleep_s)
         self.setDigIOState(ch, "low")
 
-    def open_pot_hs(self):
-        self.pulse_digital_state(12)
-
-    def close_pot_hs(self):
-        self.pulse_digital_state(11)
-
-    def pot_hs_control(self, x):
+    def _pot_hs_control(self, x):
         if x =="OPEN":
-            self.open_pot_hs()
-        elif x=="CLOSE":
-            self.close_pot_hs()
+            self.pulse_digital_state(12)
+        elif x=="CLOSED":
+            self.pulse_digital_state(11)
         elif x=="UNKNOWN":
             pass
         else:
             raise ValueError(x)
+
+    def _adr_hs_control(self, x):
+        if x =="OPEN":
+            self.pulse_digital_state(8)
+        elif x=="CLOSED":
+            self.pulse_digital_state(10)
+        elif x=="UNKNOWN":
+            pass
+        else:
+            raise ValueError(x)
+        
+    def _charcoal_hs_control(self, x):
+        if x =="OPEN":
+            self.pulse_digital_state(19)
+        elif x=="CLOSED":
+            self.pulse_digital_state(17)
+        elif x=="UNKNOWN":
+            pass
+        else:
+            raise ValueError(x)
+        
+
+        

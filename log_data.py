@@ -10,6 +10,8 @@ start_all_logging()
 from qcodes.dataset import (plot_dataset)
 import qcodes
 import pylab as plt
+import time
+from dataclasses import dataclass, field
 plt.close("all")
 plt.ion()
 
@@ -22,39 +24,76 @@ exp = load_or_create_experiment(
 
 st = get_station()
 
-time = ElapsedTimeParameter('time')
+elapsed_time = ElapsedTimeParameter('elapsed_time')
 meas = Measurement(exp=exp, name='adr run', station=st)
-meas.register_parameter(time)  # register the first independent parameter
-meas.register_parameter(st.ls370.ch02.temperature, setpoints=[time])  # now register the dependent oone
-meas.register_parameter(st.cryocon.chA_temperature, setpoints=[time])
-meas.register_parameter(st.cryocon.chB_temperature, setpoints=[time])
-meas.register_parameter(st.cryocon.chC_temperature, setpoints=[time])
-meas.register_parameter(st.cryocon.chD_temperature, setpoints=[time])
-meas.register_parameter(st.labjack.kepco_current, setpoints=[time])
-meas.register_parameter(st.labjack.kepco_voltage, setpoints=[time])
+meas.register_parameter(elapsed_time)  # register the first independent parameter
+# meas.register_parameter(st.ls370.ch02.temperature, setpoints=[time],)  # now register the dependent oone
+meas.register_parameter(st.cryocon.chA_temperature, setpoints=[elapsed_time])
+meas.register_parameter(st.cryocon.chB_temperature, setpoints=[elapsed_time])
+meas.register_parameter(st.cryocon.chC_temperature, setpoints=[elapsed_time])
+meas.register_parameter(st.cryocon.chD_temperature, setpoints=[elapsed_time])
+meas.register_parameter(st.labjack.kepco_current, setpoints=[elapsed_time])
+meas.register_parameter(st.labjack.kepco_voltage, setpoints=[elapsed_time])
 meas.register_parameter(st.labjack.relay, paramtype="text")
+meas.register_parameter(st.labjack.heatswitch_adr, paramtype="text")
+meas.register_parameter(st.labjack.heatswitch_charcoal, paramtype="text")
+meas.register_parameter(st.labjack.heatswitch_pot, paramtype="text")
+meas.register_custom_parameter("state", paramtype="text")
+meas.register_custom_parameter("faa_temperature", unit="K", setpoints=[elapsed_time])
+meas.register_custom_parameter("time", unit="s")
 
-def update(meas, datasaver):
-    parameters = [time, st.ls370.ch02.temperature, st.cryocon.chA_temperature, st.cryocon.chB_temperature,
+def update(datasaver, state):
+    parameters = [elapsed_time, st.cryocon.chA_temperature, st.cryocon.chB_temperature,
                   st.cryocon.chC_temperature, st.cryocon.chD_temperature, st.labjack.kepco_current, st.labjack.kepco_voltage,
-                  st.labjack.relay]
-    datasaver.add_result(*[(param,param()) for param in parameters])
+                  st.labjack.relay, st.labjack.heatswitch_adr, st.labjack.heatswitch_charcoal, st.labjack.heatswitch_pot]
+    l=[(param,param()) for param in parameters]+[("state", state.name()),("faa_temperature", st.ls370.ch02.temperature()), ("time", time.time())]
+    datasaver.add_result(*l)
 
 datasaver = meas.run()
 
 from imperative_statemachine import state
 from world import World
-from dataclasses import dataclass
 import typing
+
+@dataclass
+class LivePlotDataset():
+    dataset: qcodes.dataset.data_set.DataSet
+    axes: list = field(default=None, init=False)
+    fig: plt.matplotlib.figure.Figure = field(default=None, init=False)
+
+    def first_time(self):
+        axes,_ = plot_dataset(self.dataset)
+        for ax in axes:
+            plt.close(ax.figure)
+        self.fig = plt.figure(figsize=(18,6))
+        self.axes = [plt.subplot(3,3,i) for i in range(1,len(axes)+1)]
+        for ax in self.axes:
+            ax.grid(True)
+
+    def figure_exists(self):
+        if self.fig is None:
+            return False
+        return plt.fignum_exists(self.fig.number)
+
+    def plot(self):
+        if not self.figure_exists():
+            self.first_time()
+        for ax in self.axes:
+            ax.clear()
+        plot_dataset(self.dataset, self.axes)
+        plt.tight_layout()
 
 @dataclass
 class StationWorld(World):
     station: qcodes.station.Station = None
     datasaver: typing.Any = None
+    liveplot: LivePlotDataset = None
 
-    def update(self):
-        update(meas, self.datasaver)
-    
+    def update(self, state):
+        update(self.datasaver, state)
+        if self.liveplot is None:
+            self.liveplot = LivePlotDataset(self.datasaver.dataset)
+        self.liveplot.plot()
 
 world = StationWorld(station=st)
 
@@ -103,12 +142,30 @@ def ramp_down(world: StationWorld):
 def chill_after_ramp_down(world: StationWorld):
     world.wait(10)
 
+@state
+def cycle_heatswitches(world: StationWorld):
+    for i in range(10):
+        st.labjack.heatswitch_pot("OPEN")
+        world.wait(3)
+        st.labjack.heatswitch_adr("OPEN")
+        world.wait(3)
+        st.labjack.heatswitch_charcoal("OPEN")
+        world.wait(3)
+        st.labjack.heatswitch_pot("CLOSED")
+        world.wait(3)
+        st.labjack.heatswitch_adr("CLOSED")
+        world.wait(3)
+        st.labjack.heatswitch_charcoal("CLOSED")
+        world.wait_for_input("yo")
+
+
 heater = st.ls370.heater
 
-# with meas.run( ) as datasaver:
-#     world.datasaver = datasaver
-#     world.run_state(chill_after_ramp_down)
-# dataset = datasaver.dataset
-# plot_dataset(dataset)
+with meas.run( ) as datasaver:
+    world.datasaver = datasaver
+    world.run_state(cycle_heatswitches)
+dataset = datasaver.dataset
+plot_dataset(dataset)
 # plt.pause(30)
+
 

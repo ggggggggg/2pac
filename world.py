@@ -7,6 +7,8 @@ from imperative_statemachine import state, State
 from typing import Callable, Union, Any
 import random
 import numpy as np
+import pylab as plt
+from nonblocking_readline import nonblocking_readline
 
 # how to compile function from text
 # https://stackoverflow.com/questions/32429154/how-to-compile-a-function-at-run-time
@@ -16,6 +18,10 @@ import numpy as np
 @dataclass
 class WaitUntil:
     time_s: float
+
+@dataclass
+class WaitForInput:
+    target_input: str
 
 @dataclass
 class World:
@@ -28,9 +34,9 @@ class World:
         self.waiting_for = self.time.time() + seconds
 
     # do not overload
-    def _update(self):
+    def _update(self, state):
         now = self.time.time()
-        self.update()
+        self.update(state)
         if self.last_update_time_s is not None:
             elapsed_s = now-self.last_update_time_s
             self.update_with_elapsed(elapsed_s=elapsed_s)
@@ -38,7 +44,7 @@ class World:
 
     # meant to read updates from instruments in an async way
     # overload
-    def update(self):
+    def update(self, state):
         pass
 
     # overload
@@ -55,7 +61,7 @@ class World:
         while True:
             should_update, should_run_line = self.process_command_and_decide_execution()
             if should_update:
-                self._update()
+                self._update(state)
             try: 
                 if should_run_line:
                     line_number = state_gen.send(None)
@@ -102,7 +108,20 @@ class World:
                 should_update = False
                 should_process_line = True
                 return should_update, should_process_line
-        self.time.sleep(to_wait_for_tick_s)
+        elif isinstance(self.command, WaitForInput):
+            line = nonblocking_readline()
+            if line is not None:
+                line = line.strip()
+                print(f"got line! {self.command.target_input=}")
+                print(line)
+                if line == self.command.target_input:
+                    self.command = None
+                    should_update = False
+                    should_process_line = True
+                    return should_update, should_process_line
+
+
+        plt.pause(to_wait_for_tick_s)
         should_update = True
         should_process_line = False
         return should_update, should_process_line        
@@ -113,12 +132,15 @@ class World:
 
     def wait(self, seconds):
         self.command=WaitUntil(time_s = time.time()+seconds)
+
+    def wait_for_input(self, target_input):
+        self.command=WaitForInput(target_input)
             
 
     def run_state(self, state: State):
         runner = self.state_runner(state)
         time.sleep(self.next_tick_target_time_s()-time.time())
-        self._update()
+        self._update(state)
         tstart = self.last_update_time_s
         for (state, line_number) in runner:
             elapsed = self.last_update_time_s-tstart
