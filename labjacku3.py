@@ -21,6 +21,11 @@ class LabjackU3(qcodes.Instrument):
                     get_cmd=self.get_kepco_current,
                     unit="A")
         
+        self.add_parameter("pot_hs",
+                           set_cmd=self.pot_hs_control,
+                           initial_value="UNKNOWN",
+                           )
+        
     def get_idn(self) -> dict[str, str | int | None]:
         return "a labjack u3"
 
@@ -73,3 +78,24 @@ class LabjackU3(qcodes.Instrument):
             self.lj.getFeedback(u3.BitStateWrite(io_channel, 0))   # Set IO channel to low
         else:
             print('Error: Direction not valid')
+
+    def pulse_digital_state(self,ch, sleep_s=0.1):
+        self.setDigIOState(ch, "high")
+        time.sleep(sleep_s)
+        self.setDigIOState(ch, "low")
+
+    def open_pot_hs(self):
+        self.pulse_digital_state(12)
+
+    def close_pot_hs(self):
+        self.pulse_digital_state(11)
+
+    def pot_hs_control(self, x):
+        if x =="OPEN":
+            self.open_pot_hs()
+        elif x=="CLOSE":
+            self.close_pot_hs()
+        elif x=="UNKNOWN":
+            pass
+        else:
+            raise ValueError(x)

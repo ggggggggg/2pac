@@ -8,23 +8,23 @@ from lakeshore370_base import (
     BaseSensorChannel,
     LakeshoreBase,
 )
+from qcodes.instrument import InstrumentChannel
 from qcodes.parameters import Group, GroupParameter
+from bisect import bisect
+
 
 # There are 16 sensors channels (a.k.a. measurement inputs) in Model 372
 _n_channels = 16
 
 
-class LakeshoreModel370Output(BaseOutput):
+class LakeshoreModel370Output(InstrumentChannel):
     """An InstrumentChannel for control outputs (heaters) of Lakeshore Model 372"""
 
     MODES: ClassVar[dict[str, int]] = {
-        "off": 0,
-        "monitor_out": 1,
-        "open_loop": 2,
-        "zone": 3,
-        "still": 4,
-        "closed_loop": 5,
-        "warm_up": 6,
+        "closed": 1,
+        "zone": 2,
+        "open_loop": 3,
+        "off": 4,
     }
     POLARITIES: ClassVar[dict[str, int]] = {"unipolar": 0, "bipolar": 1}
     RANGES: ClassVar[dict[str, int]] = {
@@ -39,60 +39,186 @@ class LakeshoreModel370Output(BaseOutput):
         "100mA": 8,
     }
 
-    # _input_channel_parameter_kwargs: ClassVar[dict[str, Any]] = {
-    #     "get_parser": int,
-    #     "vals": vals.Numbers(1, _n_channels),
-    # }
+    _input_channel_parameter_kwargs: ClassVar[dict[str, Any]] = {
+        "get_parser": int,
+        "vals": vals.Numbers(1, _n_channels),
+    }
 
-    def __init__(
-        self, parent: "LakeshoreModel370", output_name: str, output_index: int
-    ) -> None:
-        super().__init__(parent, output_name, output_index, has_pid=True)
+    def __init__(self, parent: "LakeshoreModel370", output_name: str) -> None:
+        super().__init__(parent, output_name)
 
-        # Add more parameters for OUTMODE command
+        self.add_parameter("out",
+                           get_cmd="HTR?",
+                           set_cmd="MOUT {}",
+                           get_parser=float)
+        self.add_parameter("mode",
+                           val_mapping=self.MODES,
+                           get_cmd="CMODE?",
+                           set_cmd=f"CMODE {{}}")
+        
+        self.add_parameter("range",
+                           val_mapping = self.RANGES,
+                           get_cmd="HTRRNG?",
+                           set_cmd="HTRRNG {}")
+
+        # Add more parameters for CSET command
         # and redefine the corresponding group
-        # self.add_parameter(
-        #     "polarity",
-        #     label="Output polarity",
-        #     docstring="Specifies output polarity (not applicable to warm-up heater)",
-        #     val_mapping=self.POLARITIES,
-        #     parameter_class=GroupParameter,
-        # )
-        # self.add_parameter(
-        #     "use_filter",
-        #     label="Use filter for readings",
-        #     docstring="Specifies controlling on unfiltered or filtered readings",
-        #     val_mapping={True: 1, False: 0},
-        #     parameter_class=GroupParameter,
-        # )
-        # self.add_parameter(
-        #     "delay",
-        #     label="Delay",
-        #     unit="s",
-        #     docstring="Delay in seconds for setpoint change during Autoscanning",
-        #     vals=vals.Ints(0, 255),
-        #     get_parser=int,
-        #     parameter_class=GroupParameter,
-        # )
-        # self.output_group = Group(
-        #     [
-        #         self.mode,
-        #         self.input_channel,
-        #         self.powerup_enable,
-        #         self.polarity,
-        #         self.use_filter,
-        #         self.delay,
-        #     ],
-        #     set_cmd=f"OUTMODE {output_index}, {{mode}}, "
-        #     f"{{input_channel}}, "
-        #     f"{{powerup_enable}}, {{polarity}}, "
-        #     f"{{use_filter}}, {{delay}}",
-        #     get_cmd=f"OUTMODE? {output_index}",
-        # )
+        self.add_parameter(
+            "channel",
+            label="channel to control",
+            vals=vals.Numbers(1, _n_channels),
+            get_parser=int,
+            parameter_class=GroupParameter,
+        )
+        self.add_parameter(
+            "use_filter",
+            label="Use filter for readings",
+            docstring="Specifies controlling on unfiltered or filtered readings",
+            val_mapping={True: 1, False: 0},
+            parameter_class=GroupParameter,
+        )
+        self.add_parameter(
+            "delay",
+            label="Delay",
+            unit="s",
+            docstring="Delay in seconds for setpoint change during Autoscanning",
+            vals=vals.Ints(0, 255),
+            get_parser=int,
+            parameter_class=GroupParameter,
+        )
+        self.output_group = Group(
+            [
+                self.channel,
+                self.use_filter,
+                self.delay,
+            ],
+            set_cmd=f"CSET {{channel}}, {{use_filter}}, {{delay}}, 1, 8, 50",
+            get_cmd=f"CSET?",
+        )
+        self.add_parameter('P',
+                               label='Proportional (closed-loop)',
+                               docstring='The value for closed control loop '
+                                         'Proportional (gain)',
+                               vals=vals.Numbers(0, 1000),
+                               get_parser=float,
+                               parameter_class=GroupParameter)
+        self.add_parameter('I',
+                            label='Integral (closed-loop)',
+                            docstring='The value for closed control loop '
+                                        'Integral (reset)',
+                            vals=vals.Numbers(0, 1000),
+                            get_parser=float,
+                            parameter_class=GroupParameter)
+        self.add_parameter('D',
+                            label='Derivative (closed-loop)',
+                            docstring='The value for closed control loop '
+                                        'Derivative (rate)',
+                            vals=vals.Numbers(0, 1000),
+                            get_parser=float,
+                            parameter_class=GroupParameter)
+        self.pid_group = Group([self.P, self.I, self.D],
+                                set_cmd=f'PID {{P}}, {{I}}, {{D}}',
+                                get_cmd=f'PID?')
+        
+        self.add_parameter(
+            "setpoint",
+            label="Setpoint value (in sensor units)",
+            docstring="The value of the setpoint in the "
+            "preferred units of the control loop",
+            unit="K",
+            vals=vals.Numbers(0, 300),
+            get_parser=float,
+            set_cmd=f"SETP {{}}",
+            get_cmd=f"SETP?",
+        )
 
-        self.P.vals = vals.Numbers(0.0, 1000)
-        self.I.vals = vals.Numbers(0.0, 10000)
-        self.D.vals = vals.Numbers(0, 2500)
+        self.add_parameter('wait_cycle_time',
+                           set_cmd=None,
+                           get_cmd=None,
+                           vals=vals.Numbers(0, 100),
+                           label='Waiting cycle time',
+                           docstring='Time between two readings when waiting '
+                                     'for temperature to equilibrate',
+                           unit='s')
+        self.wait_cycle_time(0.1)
+
+        self.add_parameter('wait_tolerance',
+                           set_cmd=None,
+                           get_cmd=None,
+                           vals=vals.Numbers(0, 100),
+                           label='Waiting tolerance',
+                           docstring='Acceptable tolerance when waiting for '
+                                     'temperature to equilibrate',
+                           unit='')
+        self.wait_tolerance(0.1)
+
+        self.add_parameter('wait_equilibration_time',
+                           set_cmd=None,
+                           get_cmd=None,
+                           vals=vals.Numbers(0, 100),
+                           label='Waiting equilibration time',
+                           docstring='Duration during which temperature has to '
+                                     'be within tolerance',
+                           unit='s')
+        self.wait_equilibration_time(0.5)
+
+        self.add_parameter('blocking_t',
+                           label='Setpoint value with blocking until it is '
+                                 'reached',
+                           docstring='Sets the setpoint value, and input '
+                                     'range, and waits until it is reached. '
+                                     'Added for compatibility with Loop. Note '
+                                     'that if the setpoint value is in '
+                                     'a different range, this function may '
+                                     'wait forever because that setpoint '
+                                     'cannot be reached within the current '
+                                     'range.',
+                           vals=vals.Numbers(0, 400),
+                           set_cmd=self._set_blocking_t,
+                           snapshot_exclude=True)
+    def _set_blocking_t(self, temperature: float) -> None:
+        self.set_range_from_temperature(temperature)
+        self.setpoint(temperature)
+        self.wait_until_set_point_reached()
+        
+    def set_range_from_temperature(self, temperature: float) -> str:
+        """
+        Sets the output range of this given heater from a given temperature.
+
+        The output range is determined by the limits given through the parameter
+        `range_limits`. The output range is used for temperatures between
+        the limits `range_limits[i-1]` and `range_limits[i]`; that is
+        `range_limits` is the upper limit for using a certain heater current.
+
+        Args:
+            temperature:
+                temperature to set the range from
+
+        Returns:
+            the value of the resulting `output_range`, that is also available
+            from the `output_range` parameter itself
+        """
+        if self.range_limits.get_latest() is None:
+            raise RuntimeError('Error when calling set_range_from_temperature: '
+                               'You must specify the output range limits '
+                               'before automatically setting the range '
+                               '(e.g. inst.range_limits([0.021, 0.1, 0.2, '
+                               '1.1, 2, 4, 8]))')
+        range_limits = self.range_limits.get_latest()
+        i = bisect(range_limits, temperature)
+        # if temperature is larger than the highest range, then bisect returns
+        # an index that is +1 from the needed index, hence we need to take
+        # care of this corner case here:
+        i = min(i, len(range_limits) - 1)
+        # there is a `+1` because `self.RANGES` includes `'off'` as the first
+        # value.
+        orange = self.INVERSE_RANGES[i+1] # this is `output range` not the fruit
+        self.log.debug(f'setting output range from temperature '
+                       f'({temperature} K) to {orange}.')
+        self.output_range(orange)
+        return self.output_range()
+
+
 
 
 class LakeshoreModel370Channel(BaseSensorChannel):
@@ -303,11 +429,7 @@ class LakeshoreModel370(LakeshoreBase):
     def __init__(self, name: str, address: str, **kwargs: Any) -> None:
         super().__init__(name, address, **kwargs)
 
-        heaters = {"sample_heater": 0, "warmup_heater": 1, "analog_heater": 2}
-        for heater_name, heater_index in heaters.items():
-            self.add_submodule(
-                heater_name, LakeshoreModel370Output(self, heater_name, heater_index)
-            )
+        self.add_submodule("heater", LakeshoreModel370Output(self, output_name="heater"))
 
     def _open_resource(self, address: str, visalib: str | None) -> tuple[MessageBasedResource, str, ResourceManager]:
         # first call the existing _open_resource method

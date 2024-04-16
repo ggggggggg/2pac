@@ -8,7 +8,9 @@ from pathlib import Path
 from qcodes.logger import start_all_logging
 start_all_logging()
 from qcodes.dataset import (plot_dataset)
+import qcodes
 import pylab as plt
+plt.close("all")
 plt.ion()
 
 db_file_path = Path.home() / ".2pac_logs" / "2pac.db"
@@ -38,18 +40,75 @@ def update(meas, datasaver):
                   st.labjack.relay]
     datasaver.add_result(*[(param,param()) for param in parameters])
 
-# import IPython.lib.backgroundjobs as bg
-# from plottr.apps import inspectr
+datasaver = meas.run()
 
-# jobs = bg.BackgroundJobManager()
-# jobs.new(inspectr.main, db_file_path)
+from imperative_statemachine import state
+from world import World
+from dataclasses import dataclass
+import typing
 
-with meas.run() as datasaver:
-    for i in range(100):
-        print(i)
-        update(meas, datasaver)
-print("done")
+@dataclass
+class StationWorld(World):
+    station: qcodes.station.Station = None
+    datasaver: typing.Any = None
 
-dataset = datasaver.dataset
-plot_dataset(dataset)
+    def update(self):
+        update(meas, self.datasaver)
+    
+
+world = StationWorld(station=st)
+
+@state
+def chill_after_ramp_down(world: StationWorld):
+    world.wait(10)
+    return
+
+@state
+def zero_current(world: StationWorld):
+    world.wait(seconds=5)
+    return ramp_up
+
+@state 
+def ramp_up(world: StationWorld):
+    target_voltage = 2
+    target_time_s = 20
+    target_step_duration_s = 1
+    target_N_steps = int(target_time_s/target_step_duration_s)
+    step_size = target_voltage/target_N_steps
+    for i in range(target_N_steps):
+        world.set_voltage(step_size*(i+1))
+        world.wait(seconds=target_step_duration_s)
+    return soak
+
+@state
+def soak(world: StationWorld):
+    world.wait(20)
+    return ramp_down
+
+@state
+def ramp_down(world: StationWorld):
+    Vstart = world.voltage_V
+    target_time_s = 20
+    max_voltage = 2
+    target_step_duration_s = 1
+    target_N_steps = int(target_time_s/target_step_duration_s)
+    step_size = -np.sign(Vstart)*Vstart/target_N_steps
+    volts = np.arange(Vstart, step_size, step_size)
+    for v in volts:
+        world.set_voltage(v)
+        world.wait(target_step_duration_s)
+    return chill_after_ramp_down
+
+@state
+def chill_after_ramp_down(world: StationWorld):
+    world.wait(10)
+
+heater = st.ls370.heater
+
+# with meas.run( ) as datasaver:
+#     world.datasaver = datasaver
+#     world.run_state(chill_after_ramp_down)
+# dataset = datasaver.dataset
+# plot_dataset(dataset)
+# plt.pause(30)
 
