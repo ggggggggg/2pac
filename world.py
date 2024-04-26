@@ -58,6 +58,7 @@ class World:
         state_gen = state.func_to_make_generator(self)
         self.state_start_time = self.time.time()
         line_number = 0
+        self._update(state)
         while True:
             should_update, should_run_line = self.process_command_and_decide_execution()
             if should_update:

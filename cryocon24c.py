@@ -1,5 +1,5 @@
 from qcodes import VisaInstrument
-from qcodes.utils.validators import Numbers, Enum, Ints
+from qcodes.utils.validators import Numbers, Enum, Ints, Bool
 
 
 # get parsers
@@ -20,8 +20,9 @@ class Cryocon24C(VisaInstrument):
     """
     def __init__(self, name, address, terminator='\r\n', **kwargs):
         super().__init__(name, address, terminator=terminator, **kwargs)
-
-        on_off_map = {True: 'ON', False: 'OFF'}
+        # self.visa_handle.query_delay = 0.05 # cryocon has been unreliable on reruning temperatures
+        # maybe a delay will help?
+        # first pass says it doesn't help much
 
         for channel in ['A', 'B', 'C', 'D']:
             c = 'ch{}_'.format(channel)
@@ -66,29 +67,34 @@ class Cryocon24C(VisaInstrument):
                                get_cmd='input? {}:offset'.format(channel),
                                get_parser=float)
 
-        self.add_function('stop_control_loops', call_cmd='stop')
-        self.add_function('start_control_loops', call_cmd='control')
+
 
         # TODO: check case of returned strings
         self.add_parameter('control_enabled',
                            get_cmd='control?',
-                           val_mapping=on_off_map)
+                           set_cmd=self._set_control,
+                           get_parser=self._get_control_parser,
+                           vals=Bool())
 
         for loop in [1, 2, 3, 4]:
             l = 'loop{}_'.format(loop)
 
             self.add_parameter(l + 'source',
-                               get_cmd='loop {}:source?'.format(loop),
-                               get_parser=str.upper,
-                               set_cmd='loop {}:source {{}}'.format(loop),
-                               vals=Enum('A', 'B', 'C', 'D'))
+                            get_cmd='loop {}:source?'.format(loop),
+                            get_parser=str.upper,
+                        #    set_cmd='loop {}:source {{}}'.format(loop),
+                        # the cryocon returns a response to set commands, so we need to use ask
+                            set_cmd=lambda x: self.ask((f"loop {loop}:source {{}}").format(x)),
+                            vals=Enum('A', 'B', 'C', 'D'))
 
             self.add_parameter(l + 'setpoint',
-                               get_cmd='loop {}:setpt?'.format(loop),
-                               get_parser=floatk,
-                               set_cmd='loop {}:setpt {{}}'.format(loop),
-                               vals=Numbers(), 
-                               unit = "K")
+                            get_cmd='loop {}:setpt?'.format(loop),
+                            get_parser=floatk,
+                        #    set_cmd='loop {}:setpt {{}}'.format(loop),
+                        # the cryocon returns a response to set commands, so we need to use ask
+                            set_cmd=lambda x: self.ask((f"loop {loop}:setpt {{}}").format(x)),
+                            vals=Numbers(), 
+                            unit = "K")
 
             self.add_parameter(l + 'type',
                                get_cmd=f'loop {loop}:type?',
@@ -168,3 +174,15 @@ class Cryocon24C(VisaInstrument):
                                set_cmd='loop {}:maxp {{}}'.format(loop),
                                vals=Numbers(0, 100),
                                unit='%')
+            
+
+    def _set_control(self, x):
+        if x == True:
+            self.ask("control")
+        elif x == False:
+            self.ask("stop")
+        else:
+            raise ValueError()
+        
+    def _get_control_parser(self, x):
+        return {"ON":True, "OFF":False}[x]

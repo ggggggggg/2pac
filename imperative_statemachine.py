@@ -27,8 +27,10 @@ def insert_line_number_yields(source: str) -> str:
     for line in source.splitlines():
         new_source += f"{line}\n"
         stripped = line.lstrip()
-        n_leading_whitespace = len(line) - len(stripped)
-        if stripped.startswith("def") or stripped.startswith("for") or stripped.startswith("if"):
+        if not len(line)==0:
+            # if the line is empty, use the last value for n_leading_whitespace
+            n_leading_whitespace = len(line) - len(stripped)
+        if stripped.startswith("def") or stripped.startswith("for") or stripped.startswith("if") or stripped.startswith("while") or stripped.startswith("else") or stripped.startswith("elif"):
             n_leading_whitespace += 4
         whitespace = " " * n_leading_whitespace
         if not line.startswith("@"): # dont annotate decorator lines
