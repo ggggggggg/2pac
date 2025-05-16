@@ -20,7 +20,7 @@ class Cryocon24C(VisaInstrument):
     """
     def __init__(self, name, address, terminator='\r\n', **kwargs):
         super().__init__(name, address, terminator=terminator, **kwargs)
-        # self.visa_handle.query_delay = 0.05 # cryocon has been unreliable on reruning temperatures
+        self.visa_handle.query_delay = 0.1 # cryocon has been unreliable on reruning temperatures
         # maybe a delay will help?
         # first pass says it doesn't help much
 
@@ -76,6 +76,14 @@ class Cryocon24C(VisaInstrument):
                            get_parser=self._get_control_parser,
                            vals=Bool())
 
+        def make_set_cmd_source(loop):
+            # to avoid annoying loop capture rules
+            return lambda x: self.ask((f"loop {loop}:source {{}}").format(x))
+
+        def make_set_cmd_setpoint(loop):
+            # to avoid annoying loop capture rules
+            return lambda x: self.ask((f"loop {loop}:setpt {{}}").format(x))
+
         for loop in [1, 2, 3, 4]:
             l = 'loop{}_'.format(loop)
 
@@ -84,15 +92,15 @@ class Cryocon24C(VisaInstrument):
                             get_parser=str.upper,
                         #    set_cmd='loop {}:source {{}}'.format(loop),
                         # the cryocon returns a response to set commands, so we need to use ask
-                            set_cmd=lambda x: self.ask((f"loop {loop}:source {{}}").format(x)),
+                            set_cmd=make_set_cmd_source(loop),
                             vals=Enum('A', 'B', 'C', 'D'))
 
             self.add_parameter(l + 'setpoint',
-                            get_cmd='loop {}:setpt?'.format(loop),
+                            get_cmd='loop {loop}:setpt?',
                             get_parser=floatk,
                         #    set_cmd='loop {}:setpt {{}}'.format(loop),
                         # the cryocon returns a response to set commands, so we need to use ask
-                            set_cmd=lambda x: self.ask((f"loop {loop}:setpt {{}}").format(x)),
+                            set_cmd=make_set_cmd_setpoint(loop),
                             vals=Numbers(), 
                             unit = "K")
 

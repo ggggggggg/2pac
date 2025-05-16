@@ -29,9 +29,9 @@ class LakeshoreModel370Output(InstrumentChannel):
     POLARITIES: ClassVar[dict[str, int]] = {"unipolar": 0, "bipolar": 1}
     RANGES: ClassVar[dict[str, int]] = {
         "off": 0,
-        "31.6μA": 1,
-        "100μA": 2,
-        "316μA": 3,
+        "31.6uA": 1,
+        "100uA": 2,
+        "316uA": 3,
         "1mA": 4,
         "3.16mA": 5,
         "10mA": 6,

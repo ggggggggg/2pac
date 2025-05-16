@@ -23,6 +23,10 @@ class LabjackU3(qcodes.Instrument):
                     get_cmd=self.get_kepco_current,
                     vals = Numbers(-10,10),
                     unit="A")
+        self.add_parameter("he3_pressure",
+                    get_cmd=self.get_he3_pressure,
+                    vals = Numbers(0,10),
+                    unit="bar")
         self.add_parameter("heatswitch_pot",
                            set_cmd=self._pot_hs_control,
                            initial_value="UNKNOWN",
@@ -47,6 +51,11 @@ class LabjackU3(qcodes.Instrument):
 
     def get_kepco_current(self):
         return self.lj.getAIN(2)
+    
+    def get_he3_pressure(self, VDC_TO_PSIA=50):
+        # Omega PX409-250 strain gauge output full range = 0-5 Vdc for 0-250 psi abs
+        PSI_TO_BAR = 0.0689476
+        return self.lj.getAIN(1)*VDC_TO_PSIA*PSI_TO_BAR
 
     def set_relay(self, x):
         if x == "CONTROL":
@@ -72,12 +81,12 @@ class LabjackU3(qcodes.Instrument):
         self.setDigIOState(io_channel=io_channel, state='low')
         time.sleep(0.5)
         
-    def setRelayToRamp(self, io_channel=4):
+    def setRelayToRamp(self, io_channel=16):
         '''Switch relay to ramp mode. Default assumes ramp setting is on io=4.'''
         
         self.setRelayControl(io_channel)
         
-    def setRelayToControl(self, io_channel=5):
+    def setRelayToControl(self, io_channel=18):
         '''Switch relay to control mode. Default assumes control setting is on io=5.'''
         
         self.setRelayControl(io_channel)

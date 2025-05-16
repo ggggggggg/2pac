@@ -33,7 +33,9 @@ def insert_line_number_yields(source: str) -> str:
         if stripped.startswith("def") or stripped.startswith("for") or stripped.startswith("if") or stripped.startswith("while") or stripped.startswith("else") or stripped.startswith("elif"):
             n_leading_whitespace += 4
         whitespace = " " * n_leading_whitespace
-        if not line.startswith("@"): # dont annotate decorator lines
+        if stripped.startswith("@") or stripped.startswith("#") or len(stripped)==0: # dont annotate decorator lines or comments
+            pass
+        else:
             new_source += f"{whitespace}yield {i}\n"
         i+=1
     return new_source
