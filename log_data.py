@@ -87,27 +87,47 @@ from imperative_statemachine import state
 from world import World
 import typing
 
+import matplotlib.pyplot as plt
+from qcodes.dataset.plotting import plot_dataset
+from dataclasses import dataclass, field
+import ipywidgets as widgets
+from IPython.display import display
+from qcodes.dataset.data_set import DataSet
+
 @dataclass
-class LivePlotDataset():
-    dataset: qcodes.dataset.data_set.DataSet
+class LivePlotDataset:
+    dataset: DataSet
     axes: list = field(default=None, init=False)
     extra_ax: plt.matplotlib.axes._axes.Axes = field(default=None, init=False)
     fig: plt.matplotlib.figure.Figure = field(default=None, init=False)
+    dropdown: widgets.Dropdown = field(default=None, init=False)
 
     def first_time(self):
-        axes,_ = plot_dataset(self.dataset)
+        axes, _ = plot_dataset(self.dataset)
         for ax in axes:
             plt.close(ax.figure)
-        self.fig = plt.figure(figsize=(18,6))
-        self.axes = [plt.subplot(3,3,i) for i in range(1,len(axes)+1)]
-        self.extra_ax = plt.subplot(3,3,len(axes)+1)
+        self.fig = plt.figure(figsize=(18, 6))
+        self.axes = [plt.subplot(3, 3, i) for i in range(1, len(axes) + 1)]
+        self.extra_ax = plt.subplot(3, 3, len(axes) + 1)
         for ax in self.axes:
             ax.grid(True)
 
+        # Create and display dropdown
+        self.dropdown = widgets.Dropdown(
+            options=['Option 1', 'Option 2', 'Option 3'],
+            value='Option 1',
+            description='Select:',
+        )
+        self.dropdown.observe(self._on_dropdown_change, names='value')
+        display(self.dropdown)
+
+    def _on_dropdown_change(self, change):
+        # Handle dropdown changes (you can trigger different behavior here)
+        print(f"Dropdown changed to: {change['new']}")
+        self.plot()  # Re-plot when dropdown changes if needed
+
     def figure_exists(self):
-        if self.fig is None:
-            return False
-        return plt.fignum_exists(self.fig.number)
+        return self.fig is not None and plt.fignum_exists(self.fig.number)
 
     def plot(self):
         if not self.figure_exists():
@@ -116,10 +136,11 @@ class LivePlotDataset():
             ax.clear()
         plot_dataset(self.dataset, self.axes)
         self.extra_ax.clear()
-        # self.extra_ax.set_axis_off()
+
+        # Example: update extra_ax with recent measurement info
         s = pretty_str_dict(most_recent_measurements())
+        self.extra_ax.text(0, 0, s, transform=self.extra_ax.transAxes)
         plt.tight_layout()
-        self.extra_ax.text(0,0, s, transform=self.extra_ax.transAxes)
 
 
 @dataclass
@@ -423,7 +444,7 @@ def cycle_charcoal_hs(world: StationWorld):
 
 @state
 def wait_forever(world: StationWorld):
-    world.wait(1e6)
+    world.wait(1e15)
 
  
 @state
@@ -486,7 +507,7 @@ def start_adr_cycle(world:StationWorld):
 
 with meas.run() as datasaver:
     world.datasaver = datasaver
-    # world.run_state(wait_forever)
+    world.run_state(wait_forever)
     # world.run_state(start_he3_cycle)
     # world.run_state(ready_for_cooldown)
     # world.run_state(ramp_tester)
@@ -495,7 +516,7 @@ with meas.run() as datasaver:
     # world.run_state(slow_close_charcoal_heatswitch)
     # world.run_state(cycle_heatswitches)
     # world.run_state(soak)
-    world.run_state(full_cycle_one_state)
+    # world.run_state(full_cycle_one_state)
 dataset = datasaver.dataset
 # plot_dataset(dataset)
 # plt.pause(30)
