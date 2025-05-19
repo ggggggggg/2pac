@@ -46,6 +46,7 @@ def plot_data(run_id):
                                             axes2[0][0], axes2[0][1], axes2[1][0], axes2[1][1]]
     qc.dataset.plot_by_id(run_id = run_id, axes= axes_list)
     dataset = qc.load_by_id(run_id=run_id)
+    
     for i, ax in enumerate(axes_list):
         ax.set( ylabel = ylabels[i], title = names[i])
         # ax.grid(ls = ':', alpha = 0.75)

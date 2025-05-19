@@ -50,7 +50,8 @@ class LakeshoreModel370Output(InstrumentChannel):
         self.add_parameter("out",
                            get_cmd="HTR?",
                            set_cmd="MOUT {}",
-                           get_parser=float)
+                           get_parser=float,
+                           unit="%")
         self.add_parameter("mode",
                            val_mapping=self.MODES,
                            get_cmd="CMODE?",

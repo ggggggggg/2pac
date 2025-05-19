@@ -20,8 +20,8 @@ import qcodes
 import pylab as plt
 import time
 from dataclasses import dataclass, field
-plt.close("all")
-plt.ion()
+# plt.close("all")
+# plt.ion()
 
 db_file_path = Path.home() / ".2pac_logs" / "2pac.db"
 initialise_or_create_database_at(Path.home() / ".2pac_logs" / "2pac.db")
@@ -29,6 +29,7 @@ exp = load_or_create_experiment(
     experiment_name='running 2pac adr',
     sample_name="no sample"
 )
+datasaver_global = None # init this later
 
 st = get_station()
 
@@ -73,7 +74,7 @@ def update(datasaver, state):
     datasaver.add_result(*l)
 
 def most_recent_measurements():
-    data = datasaver.dataset.cache.data()
+    data = datasaver_global.dataset.cache.data()
     ret = {}
     for key in data.keys():
         v = data[key][key][-1]
@@ -111,7 +112,7 @@ def full_cycle_one_state(world: StationWorld):
     # 1. check that we're cold enough to start
     while True:
         mr = most_recent_measurements()
-        print(mr)
+        # print(mr)
         # if mr["cryocon_chB_temperature"] > 5:
         #     print("charcoal too hot")
         #     continue
@@ -262,6 +263,25 @@ def ready_for_cooldown(world:StationWorld):
     world.wait(1e6)
 
 @state
+def open_charcoal_heatswitch(world: StationWorld):
+    world.station.labjack.heatswitch_charcoal("OPEN")
+    return wait_forever
+
+@state
+def open_pot_heatswitch(world: StationWorld):
+    world.station.labjack.heatswitch_pot("OPEN")
+    return wait_forever
+
+@state
+def open_adr_heatswitch(world: StationWorld):
+    world.station.labjack.heatswitch_adr("OPEN")
+    return wait_forever
+
+@state
+def set_relay_to_ramp(world: StationWorld):
+    world.station.labjack.relay("RAMP")
+
+@state
 def warmup_300K(world: StationWorld):
     world.station.labjack.heatswitch_pot("CLOSED")
     world.station.labjack.heatswitch_adr("CLOSED")
@@ -274,158 +294,354 @@ def warmup_300K(world: StationWorld):
     world.station.cryocon.control_enabled(True) # heat charcoal
     world.wait(1e15)
 
-with meas.run() as datasaver:
-    world = StationWorld(station=st)
 
-    world.datasaver = datasaver
 
-    states_list = [wait_forever, wait_forever2, switch_to_wait_forever_test, 
-                   warmup_300K, full_cycle_one_state,
-                   ready_for_cooldown]
-    states_dict = {state.name(): state for state in states_list}
 
-    # Worker thread that calls get_data in the background
-    class DataFetchThread(QThread):
-        state_update = pyqtSignal(str, str)
-        def __init__(self):
-            super().__init__()
-            self.next_state = wait_forever
-            self.state = None
-            self.current_combo_value = "a"  # Default value
+# Worker thread that calls get_data in the background
+class DataFetchThread(QThread):
+    state_update = pyqtSignal(str, str)
+    def __init__(self, world, first_state, states_dict):
+        super().__init__()
+        self.world = world
+        self.next_state = first_state
+        self.states_dict = states_dict
+        self.state = None
+        self.current_combo_value = "a"  # Default value
 
-        def set_combo_value(self, value: str):
-            print(f"[Thread] Dropdown updated to: {value}")
-            self.current_combo_value = value
-            self.next_state = states_dict[value]
+    def set_combo_value(self, value: str):
+        print(f"[Thread] Dropdown updated to: {value}")
+        self.current_combo_value = value
+        self.next_state = self.states_dict[value]
+    
+    def run(self):
+        runner = self.world.state_runner(self.next_state)
+        self.state = self.next_state
+        self.next_state = None
+        state = self.state
+        time.sleep(max(0, self.world.next_tick_target_time_s()-time.time()))
+        self.world._update(state)
+        tstart = self.world.last_update_time_s
+        for (state, line_number) in runner:
+            self.state = state
+            if self.next_state is not None:
+                print("switching state")
+                self.run()
+            elapsed = self.world.last_update_time_s-tstart
+            s1 = f"state={state.name()} {line_number=} {elapsed=:.2f} state_elapsed_s={self.world.state_elapsed_s():.2f}"
+            s2 = state.code_highlighted(line_number)
+            self.state_update.emit(s1, s2)
+
+def adjust_lightness(color, amount=0.5):
+    import matplotlib.colors as mc
+    import colorsys
+    try:
+        c = mc.cnames[color]
+    except:
+        c = color
+    c = colorsys.rgb_to_hls(*mc.to_rgb(c))
+    return colorsys.hls_to_rgb(c[0], max(0, min(1, amount * c[1])), c[2])
+    
         
-        def run(self):
-            runner = world.state_runner(self.next_state)
-            self.state = self.next_state
-            self.next_state = None
-            state = self.state
-            time.sleep(world.next_tick_target_time_s()-time.time())
-            world._update(state)
-            tstart = world.last_update_time_s
-            for (state, line_number) in runner:
-                self.state = state
-                if self.next_state is not None:
-                    print("switching state")
-                    self.run()
-                elapsed = world.last_update_time_s-tstart
-                s1 = f"state={state.name()} {line_number=} {elapsed=:.2f} state_elapsed_s={world.state_elapsed_s():.2f}"
-                s2 = state.code_highlighted(line_number)
-                self.state_update.emit(s1, s2)
+def plot_dataset(dataset, ax, xloc_mouse):
+    # Save the current zoom/pan state
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+
+    # Clear the plot and plot the new data
+    ax.clear()
+    data = dataset.cache.data()
+    # print(data)
+    t = dataset.cache.data()["time"]["time"]
+    x = t-t[0] 
+    if xloc_mouse is None:
+        xloc_ind = None
+        data_xloc = None
+    else:
+        xloc_ind = np.argmin(np.abs(x-xloc_mouse))
+        data_xloc = {key:data[key][key][xloc_ind] for key in data.keys()}
+    data_mr = {key:data[key][key][-1] for key in data.keys()}
+    # print(f"{list(data.keys())=}")
+    keys_hs = ["labjack_heatswitch_adr", "labjack_heatswitch_charcoal", "labjack_heatswitch_pot", "labjack_relay"]
+    units = {param_spec.name:param_spec.unit for param_spec in dataset.get_parameters()}
+    for key in data.keys():
+        if key == "time" or key =="state" or key in keys_hs:
+            continue
+        v = data[key][key]
+        unit = units[key]
+        try:
+            val = data_mr[key]
+            ax.plot(x, v, label=f"{key}={val:.2f} {unit}")
+        except:
+            print(f"failed to plot {key}")
+
+    from matplotlib.cm import get_cmap
+    from matplotlib.colors import to_rgb
+    cmap = get_cmap('tab10')  # or 'tab20', 'Set1', etc.
+    base_colors = [cmap(i) for i in range(len(keys_hs))]  # RGBA tuples
+
+    for i, key in enumerate(keys_hs):
+        if key == "labjack_relay":
+            v_open = np.array([d=="CONTROL" for d in data[key][key]])
+            v_closed = np.array([d=="RAMP" for d in data[key][key]])
+            v_unknown = np.array([d=="UNKNOWN" for d in data[key][key]])
+        else:
+            v_open = np.array([d=="OPEN" for d in data[key][key]])
+            v_closed = np.array([d=="CLOSED" for d in data[key][key]])
+            v_unknown = np.array([d=="UNKNOWN" for d in data[key][key]])            
+        yval = (2e-2)*(0.9**i)
+        y_open = np.where(v_open, yval, np.nan)
+        y_closed = np.where(v_closed, yval, np.nan)
+        y_unknown = np.where(v_unknown, yval, np.nan)
 
 
-    class MyApp(QWidget):
-        def __init__(self):
-            super().__init__()
+        color = base_colors[i]
+        color_light = adjust_lightness(color)
 
-            # Set up the main window layout
-            self.setWindowTitle("PyQt5 with Matplotlib")
-            main_layout = QHBoxLayout()  # Use HBox to place plot on the left and UI elements on the right
+        val = data_mr[key]
 
-            # Create the plot and canvas
-            self.figure = plt.Figure(figsize=(12.5, 10))
-            self.ax = self.figure.add_subplot(111)            
-            self.canvas = FigureCanvas(self.figure)
-            self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        ax.plot(x, y_closed, color=color, lw=4, label=f"{key}={val}")
+        ax.plot(x, y_open, color=color, lw=2)
+        ax.plot(x, y_unknown, "--", color=color, lw=2)
 
-            # Set up the plot layout
-            plot_layout = QVBoxLayout()
-            plot_layout.addWidget(self.toolbar)
-            plot_layout.addWidget(self.canvas)
 
-            # Set up the right-side layout for UI elements
-            right_layout = QVBoxLayout()
 
-            # Create dropdown (ComboBox)
-            self.combo_box = QComboBox(self)
-            self.combo_box.addItems(list(states_dict.keys()))
-            self.combo_box.currentTextChanged.connect(self.update_title)
-            right_layout.addWidget(self.combo_box)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+    # Add text annotation below the plot
+    if data_xloc is not None:
+        annotation_lines =[]
+        val = x[xloc_ind]
+        annotation_lines.append(f"{elapsed_time}={val} s")
+        for key in data.keys():
+            if key in keys_hs+["state"]:
+                continue
+            val = data_xloc[key]
+            unit = units[key]
+            line = f"{key}={val:.3f} {unit}"
+            annotation_lines.append(line)
+        for key in keys_hs+["state"]:
+            val = data_xloc[key]
+            line = f"{key}={val}"
+            annotation_lines.append(line)
 
-            # Set up the text output field with a vertical scroll bar
-            self.text_output = QTextEdit(self)
-            self.text_output.setText("") 
-            self.text_output.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)  # Always show the scroll bar
-            self.text_output.setReadOnly(True)  # Make the text field non-editable
-            right_layout.addWidget(self.text_output)
+        ax.axvline(xloc_mouse)
+        annotation_text = "\n".join(annotation_lines)
+        ax.text(
+            1.05, 0.5,  # x, y in axes coordinates
+            annotation_text,
+            transform=ax.transAxes,
+            fontsize=12,
+            verticalalignment='top',
+            horizontalalignment='left',
+            family='monospace',
+        )    
+    ax.set_yscale("log")
+    ax.grid(True, which="both", axis="both")
+    # ax.set_ylim(ylim)
+    # ax.set_xlim(xlim)
 
-            # Add elements with "open" / "closed" labels
-            self.status_layout = QVBoxLayout()
+def get_arrow_linenum(s2):
+    # Split the string into lines
+    lines = s2.split('\n')
 
-            # Create labels for "open" / "closed"
-            self.labels = [QLabel(f"Item {i+1}: Closed") for i in range(3)]
+    # Find the index of the line starting with '-->'
+    for i, line in enumerate(lines):
+        if line.startswith('-->'):
+            # print(f"Index of the line starting with '-->': {i}")
+            break
+    return i
 
-            for label in self.labels:
-                self.status_layout.addWidget(label)  # Add each label to the layout
+def get_arrow_char_index(s2, plus=0):
+    lines = s2.split('\n')
+    char_index = 0
 
-            right_layout.addLayout(self.status_layout)
+    for line in lines:
+        if line.startswith('-->'):
+            return min(char_index+plus, len(s2)-1)
+        # Add length of line + 1 for the newline character
+        char_index += len(line) + 1
 
-            # Add a text input field
-            self.text_input = QLineEdit(self)
-            self.text_input.setPlaceholderText("Enter some text here...")
-            right_layout.addWidget(self.text_input)
+    return 0  # Not found
 
-            # Add right_layout to the main layout
-            main_layout.addLayout(plot_layout)
-            main_layout.addLayout(right_layout)
+def color_line(textedit, line_number, color=None):
+    from PyQt5.QtGui import QTextCursor, QTextCharFormat, QColor
 
-            # Set the layout for the window
-            self.setLayout(main_layout)
+    if color is None:
+        color = QColor("yellow")  # Default color if none is provided
 
-            # Set up the background thread to fetch data
-            self.data_thread = DataFetchThread()
-            self.data_thread.state_update.connect(self.state_update)
-            self.combo_box.currentTextChanged.connect(self.data_thread.set_combo_value)
-            self.data_thread.start()
+    # Access the document and validate line number
+    doc = textedit.document()
+    if line_number < 0 or line_number >= doc.blockCount():
+        return  # Out of range
 
-            self.update_plot()
+    # Clear all previous highlights by resetting formatting for all blocks
+    cursor = QTextCursor(doc)
+    cursor.beginEditBlock()  # Group all changes for efficiency
 
-        def update_title(self):
-            selected = self.combo_box.currentText()
-            self.setWindowTitle(f"Selected: {selected}")
+    block = doc.firstBlock()
+    while block.isValid():
+        block_cursor = QTextCursor(block)
+        block_cursor.select(QTextCursor.LineUnderCursor)
+        block_cursor.setCharFormat(QTextCharFormat())  # Reset to default
+        block = block.next()
 
-        def state_update(self, s1, s2):
-            # print(s1)
-            self.text_output.setText(s2)
-            self.update_plot()
+    cursor.endEditBlock()
 
-        def update_plot(self):
-            try:
-                dataset = datasaver.dataset
-            except:
-                print("dataset doesnt exist")
-                return
-            # Save the current zoom/pan state
-            # xlim = self.ax.get_xlim()
-            # ylim = self.ax.get_ylim()
+    # Now, highlight the specified line
+    block = doc.findBlockByNumber(line_number)
+    cursor = QTextCursor(block)
 
-            # Clear the plot and plot the new data
-            self.ax.clear()
-            data = dataset.cache.data()
-            x= dataset.cache.data()["time"]["time"]
-            for key in data.keys():
-                if key == "time":
-                    continue
-                v = data[key][key]
-                try:
-                    self.ax.plot(x, v, label=key)
-                except:
-                    pass
-            self.ax.legend()
-            self.ax.set_yscale("log")
+    # Set the background color for the specified line
+    fmt = QTextCharFormat()
+    fmt.setBackground(color)
 
-            # Restore the zoom/pan state
-            # self.ax.set_xlim(xlim)
-            # self.ax.set_ylim(ylim)
+    # Select the entire line and apply the format
+    cursor.select(QTextCursor.LineUnderCursor)
+    cursor.setCharFormat(fmt)
 
-            # Redraw the canvas
-            self.canvas.draw()
 
-    # Initialize the application and show the window
-    app = QApplication(sys.argv)
-    window = MyApp()
-    window.show()
-    sys.exit(app.exec_())
+
+
+class MyApp(QWidget):
+    def __init__(self, world, dataset, states_dict):
+        super().__init__()
+
+        screen_geometry = QApplication.desktop().screenGeometry()
+        screen_width = screen_geometry.width()
+        screen_height = screen_geometry.height()
+
+        # Set the window size: Maximized width, and a fixed height
+        self.setGeometry(0, 0, screen_width, int(0.7*screen_height))      
+
+        # dont assign wrold because we pass it to another thread
+        # dataset seems thread safe?
+        self.world = world # but hey maybe it will work anyway?
+        self.dataset = dataset
+        self.states_dict = states_dict
+
+        # Set up the main window layout
+        self.setWindowTitle("PyQt5 with Matplotlib")
+        main_layout = QHBoxLayout()  # Use HBox to place plot on the left and UI elements on the right
+
+        # Create the plot and canvas
+        self.figure = plt.Figure(figsize=(12.5, 10))
+        self.ax = self.figure.add_subplot(111)            
+        self.canvas = FigureCanvas(self.figure)
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        self.figure.canvas.mpl_connect("motion_notify_event", self.mpl_on_mouse_move)
+
+        # Set up the plot layout
+        plot_layout = QVBoxLayout()
+        plot_layout.addWidget(self.toolbar)
+        plot_layout.addWidget(self.canvas)
+
+        # Set up the right-side layout for UI elements
+        right_layout = QVBoxLayout()
+
+        # Create dropdown (ComboBox)
+        self.combo_box = QComboBox(self)
+        self.combo_box.addItems(list(states_dict.keys()))
+        self.combo_box.currentTextChanged.connect(self.update_title)
+        right_layout.addWidget(self.combo_box)
+
+        # Set up the text output field with a vertical scroll bar
+        self.text_output = QTextEdit(self)
+        self.text_output.setText("") 
+        self.text_output.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)  # Always show the scroll bar
+        self.text_output.setLineWrapMode(QTextEdit.NoWrap)
+        self.text_output.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.text_output.setMinimumWidth(250)
+        
+        self.text_output.setReadOnly(True)  # Make the text field non-editable
+        right_layout.addWidget(self.text_output)
+
+        # Add elements with "open" / "closed" labels
+        self.status_layout = QVBoxLayout()
+
+        # Create labels for "open" / "closed"
+        # self.labels = [QLabel(f"Item {i+1}: Closed") for i in range(4)]
+
+        # for label in self.labels:
+        #     self.status_layout.addWidget(label)  # Add each label to the layout
+
+        right_layout.addLayout(self.status_layout)
+
+        # Add a text input field
+        self.text_input = QLineEdit(self)
+        self.text_input.setPlaceholderText("Enter some text here...")
+        right_layout.addWidget(self.text_input)
+
+        # Add right_layout to the main layout
+        main_layout.addLayout(plot_layout)
+        main_layout.addLayout(right_layout)
+
+        # Set the layout for the window
+        self.setLayout(main_layout)
+
+        # Set up the background thread to fetch data
+        self.data_thread = DataFetchThread(world, 
+                                           first_state=wait_forever, 
+                                           states_dict=states_dict)
+        self.data_thread.state_update.connect(self.state_update)
+        self.combo_box.currentTextChanged.connect(self.data_thread.set_combo_value)
+        self.data_thread.start()
+
+        self.on_mouse_move_event = None
+        self.update_plot()
+
+    def update_title(self):
+        selected = self.combo_box.currentText()
+        self.setWindowTitle(f"Selected: {selected} curent_wait={self.world.to_wait_for_process_line:.6g} s")
+
+    def state_update(self, s1, s2):
+        # print(s1)
+        self.update_title()
+        self.text_output.setText(s2)
+        textCursor = self.text_output.textCursor()
+        textCursor.setPosition(get_arrow_char_index(s2,plus=100))
+        color_line(self.text_output, get_arrow_linenum(s2))
+        self.text_output.setTextCursor(textCursor)
+        keys_hs = ["labjack_heatswitch_adr", "labjack_heatswitch_charcoal", "labjack_heatswitch_pot", "labjack_relay"]
+        # mr = most_recent_measurements()
+        # for i, key in enumerate(keys_hs):
+        #     value = mr[key]
+        #     self.labels[i].setText(f"{key} {value}")
+        self.update_plot()
+
+    def update_plot(self):
+        dataset = self.dataset
+        if self.on_mouse_move_event is None:
+            xloc_for_vals = None
+        else:
+            xloc_for_vals = self.on_mouse_move_event.xdata
+        plot_dataset(dataset, self.ax, xloc_for_vals)
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def mpl_on_mouse_move(self, event):
+        self.on_mouse_move_event=event
+
+
+
+def main():
+    with meas.run() as datasaver:
+        world = StationWorld(station=st)
+
+        global datasaver_global
+        datasaver_global = datasaver
+        world.datasaver = datasaver
+
+        states_list = [wait_forever, wait_forever2, switch_to_wait_forever_test, 
+                    warmup_300K, full_cycle_one_state,
+                    ready_for_cooldown, open_adr_heatswitch, set_relay_to_ramp]
+        states_dict = {state.name(): state for state in states_list}
+        world._update(wait_forever)
+        dataset = datasaver.dataset
+
+        # Initialize the application and show the window
+        app = QApplication(sys.argv)
+        window = MyApp(world, dataset, states_dict)
+        window.show()
+        sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()

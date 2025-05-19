@@ -29,7 +29,8 @@ class Cryocon24C(VisaInstrument):
 
             self.add_parameter(c + 'temperature',
                                get_cmd='input? {}'.format(channel),
-                               get_parser=float)
+                               get_parser=float,
+                               unit="K")
 
             self.add_parameter(c + 'units',
                                get_cmd='input {}:units?'.format(channel),
