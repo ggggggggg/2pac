@@ -463,7 +463,7 @@ def warmup_300K(world: StationWorld):
     world.station.cryocon.loop2_source("B")
     world.station.cryocon.loop2_setpoint(295) # Charcoal setpoint = 295 K
     world.station.cryocon.control_enabled(True) # heat charcoal
-    return wait_forever
+    world.wait(1e15)
 
 
 @state

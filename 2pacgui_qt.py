@@ -97,7 +97,141 @@ class StationWorld(World):
 
     def update(self, state):
         update(self.datasaver, state)
-        print("yo i updated")
+
+@state 
+def full_cycle_one_state(world: StationWorld):
+    testmode = False
+    # 1. check that we're cold enough to start
+    # 2. start heating charcoal
+    # 3. ramp up adr
+    # 4. wait for he3 to condense
+    # 5. cool charcoal
+    # 6. ramp down adr
+
+    # 1. check that we're cold enough to start
+    while True:
+        mr = most_recent_measurements()
+        print(mr)
+        # if mr["cryocon_chB_temperature"] > 5:
+        #     print("charcoal too hot")
+        #     continue
+
+        # if mr["cryocon_chC_temperature"] > 3.2:
+        #     print("3K plate too hot")
+        #     continue
+        world.wait(1)
+        break
+
+    world.station.labjack.heatswitch_pot("CLOSED")
+    world.wait(1)
+    world.station.labjack.heatswitch_adr("CLOSED")
+    world.wait(1)
+    world.station.labjack.heatswitch_charcoal("OPEN")
+    world.wait(1)
+
+
+    # 2. start heating charcoal
+    world.station.cryocon.loop1_source("A")
+    world.wait(1)
+    world.station.cryocon.loop1_setpoint(65) # Upper stage setpoint = 45 K, trying higher so i t actually goes up?
+    # our base temp is about 60K, so 45K does nothing
+    # notices that if i head to 65 K then cool back down the He3 temp drops a lot
+    world.wait(1)
+    world.station.cryocon.loop2_source("B")
+    world.wait(1)
+    world.station.cryocon.loop2_setpoint(55) # Charcoal setpoint = 55 K
+    world.wait(1)
+    world.station.cryocon.control_enabled(True) # heat charcoal
+    world.wait(1)
+
+
+    # 3. ramp up adr
+    world.station.labjack.relay("RAMP")
+    world.wait(1)
+    ramp_controller = world.station.ls370.heater
+    ramp_controller.mode('open_loop')
+    world.wait(1)
+    ramp_controller.range("100uA")
+    world.wait(1)
+    hout_start =0
+    if testmode:
+        target_hout = 1 # small max current
+        target_time_s = 30
+    else:
+        target_hout= 55  # 55 should get to 9.53 A, which is the hardware current limit of the kepco supply
+        target_time_s = 30*60
+    target_step_duration_s = 1
+    target_N_steps = int(target_time_s/target_step_duration_s)
+    step_size = target_hout/target_N_steps
+    houts_up = np.arange(target_N_steps)*step_size
+    for hout in houts_up:
+        ramp_controller.out(hout)
+        world.wait(target_step_duration_s)
+
+    # 4. wait for he3 to condense
+    if testmode:
+        world.wait(10)
+    else:
+        world.wait(3600*3.5) # takes about 2 hours
+
+    # 4. cool charcoal
+    world.station.labjack.heatswitch_pot("OPEN")
+    world.wait(1)
+    world.station.cryocon.control_enabled(False) # turn off 40K heat after cooling pot
+    if testmode:
+        world.wait(1)
+    else: 
+        world.wait(120) # a bit of cooling before closing charcoal heatswitch
+    world.station.labjack.heatswitch_charcoal("CLOSED")  
+    world.wait(1)
+    # while True:
+    #     mr = most_recent_measurements()
+    #     print(mr)
+    #     if mr["cryocon_chB_temperature"] < 6:
+    #         break
+    #     else:
+    #         print("charcoal not yet cooled")
+    #     world.wait(1)
+    if testmode:
+        world.wait(10)
+    else:
+        world.wait(3660*3)
+        world.station.cryocon.loop1_setpoint(65) # Upper stage setpoint = 45 K, trying higher so i t actually goes up?
+        # our base temp is about 60K, so 45K does nothing
+        # notices that if i head to 65 K then cool back down the He3 temp drops a lot
+        world.wait(1)
+        world.station.cryocon.loop2_source("B")
+        world.wait(1)
+        world.station.cryocon.loop2_setpoint(1) # Charcoal setpoint = 1 K, AKA OFF
+        world.wait(1)
+        world.station.cryocon.control_enabled(True) # heat 40K stage
+        world.wait(3600*0.5) # takes about 2 hours
+        world.station.cryocon.control_enabled(False) # turn off 40K heat after cooling pot
+        world.wait(3660*0.5)
+        # test based on seeing pot temp drop (400 mK to 300 mK)
+        # after heating and cooling 40K stage 60K->65K->60K 
+
+    # 5. ramp down adr
+    world.station.labjack.heatswitch_adr("OPEN")
+    world.wait(1)
+    houts_down = houts_up[::-1]
+    for hout in houts_down:
+        ramp_controller.out(hout)
+        world.wait(target_step_duration_s)
+    if testmode:
+        world.wait(30)
+    else:
+        world.wait(20*60) # let magnet current get smaller
+    world.station.labjack.relay("CONTROL")
+    # world.wait(1)
+    # ramp_controller.setpoint(0.05)
+    # world.wait(1)
+    # ramp_controller.mode('closed')
+
+
+    
+    # be done
+    return wait_forever
 
 @state
 def wait_forever(world: StationWorld):
@@ -107,27 +241,81 @@ def wait_forever(world: StationWorld):
 def wait_forever2(world: StationWorld):
     world.wait(1e18)
 
+@state
+def switch_to_wait_forever_test(world: StationWorld):
+    return wait_forever
+
+@state
+def ready_for_cooldown(world:StationWorld):
+    # Doesn't really do anything except close HS 
+    world.station.labjack.heatswitch_pot("CLOSED")
+    world.station.labjack.heatswitch_adr("CLOSED")
+    world.station.labjack.heatswitch_charcoal("CLOSED")
+    world.wait(3)
+
+    # Set He3 setpoints but do nothing
+    world.station.cryocon.loop1_source("A")
+    world.station.cryocon.loop1_setpoint(45) # Upper stage setpoint = 45 K
+    world.station.cryocon.loop2_source("B")
+    world.station.cryocon.loop2_setpoint(55) # Charcoal setpoint = 55 K
+    world.station.cryocon.control_enabled(False) 
+    world.wait(1e6)
+
+@state
+def warmup_300K(world: StationWorld):
+    world.station.labjack.heatswitch_pot("CLOSED")
+    world.station.labjack.heatswitch_adr("CLOSED")
+    world.station.labjack.heatswitch_charcoal("CLOSED")
+    world.wait(3)
+    world.station.cryocon.loop1_source("A")
+    world.station.cryocon.loop1_setpoint(295) # Upper stage setpoint = 300 K
+    world.station.cryocon.loop2_source("B")
+    world.station.cryocon.loop2_setpoint(295) # Charcoal setpoint = 295 K
+    world.station.cryocon.control_enabled(True) # heat charcoal
+    world.wait(1e15)
+
 with meas.run() as datasaver:
     world = StationWorld(station=st)
 
     world.datasaver = datasaver
 
+    states_list = [wait_forever, wait_forever2, switch_to_wait_forever_test, 
+                   warmup_300K, full_cycle_one_state,
+                   ready_for_cooldown]
+    states_dict = {state.name(): state for state in states_list}
+
     # Worker thread that calls get_data in the background
     class DataFetchThread(QThread):
-        data_fetched = pyqtSignal(np.ndarray)
+        state_update = pyqtSignal(str, str)
+        def __init__(self):
+            super().__init__()
+            self.next_state = wait_forever
+            self.state = None
+            self.current_combo_value = "a"  # Default value
 
+        def set_combo_value(self, value: str):
+            print(f"[Thread] Dropdown updated to: {value}")
+            self.current_combo_value = value
+            self.next_state = states_dict[value]
+        
         def run(self):
-            global wait_forever
-            state = wait_forever
-            runner = world.state_runner(state)
+            runner = world.state_runner(self.next_state)
+            self.state = self.next_state
+            self.next_state = None
+            state = self.state
             time.sleep(world.next_tick_target_time_s()-time.time())
             world._update(state)
             tstart = world.last_update_time_s
             for (state, line_number) in runner:
+                self.state = state
+                if self.next_state is not None:
+                    print("switching state")
+                    self.run()
                 elapsed = world.last_update_time_s-tstart
-                print(f"state={state.name()} {line_number=} {elapsed=:.2f} state_elapsed_s={world.state_elapsed_s():.2f}")
-                print(state.code_highlighted(line_number))
-                self.data_fetched.emit(np.zeros(4))
+                s1 = f"state={state.name()} {line_number=} {elapsed=:.2f} state_elapsed_s={world.state_elapsed_s():.2f}"
+                s2 = state.code_highlighted(line_number)
+                self.state_update.emit(s1, s2)
+
 
     class MyApp(QWidget):
         def __init__(self):
@@ -153,13 +341,13 @@ with meas.run() as datasaver:
 
             # Create dropdown (ComboBox)
             self.combo_box = QComboBox(self)
-            self.combo_box.addItems(["a", "b", "c"])
+            self.combo_box.addItems(list(states_dict.keys()))
             self.combo_box.currentTextChanged.connect(self.update_title)
             right_layout.addWidget(self.combo_box)
 
             # Set up the text output field with a vertical scroll bar
             self.text_output = QTextEdit(self)
-            self.text_output.setText("This is a static text line.\n" * 10)  # Static 10 lines of text
+            self.text_output.setText("") 
             self.text_output.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)  # Always show the scroll bar
             self.text_output.setReadOnly(True)  # Make the text field non-editable
             right_layout.addWidget(self.text_output)
@@ -189,7 +377,8 @@ with meas.run() as datasaver:
 
             # Set up the background thread to fetch data
             self.data_thread = DataFetchThread()
-            self.data_thread.data_fetched.connect(self.update_plot)
+            self.data_thread.state_update.connect(self.state_update)
+            self.combo_box.currentTextChanged.connect(self.data_thread.set_combo_value)
             self.data_thread.start()
 
             self.update_plot()
@@ -197,6 +386,11 @@ with meas.run() as datasaver:
         def update_title(self):
             selected = self.combo_box.currentText()
             self.setWindowTitle(f"Selected: {selected}")
+
+        def state_update(self, s1, s2):
+            # print(s1)
+            self.text_output.setText(s2)
+            self.update_plot()
 
         def update_plot(self):
             try:
