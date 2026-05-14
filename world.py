@@ -28,7 +28,7 @@ class World:
     last_update_time_s: float = field(default=None,init=False)
     time: Any = field(default = time, init=False)
     command: Union[Any, None] = None
-    target_tick_rate_s: int = 1
+    target_tick_rate_s: int = 4
     state_start_time: float = field(default=0.0, init=False)
     def wait(self, seconds):
         self.waiting_for = self.time.time() + seconds

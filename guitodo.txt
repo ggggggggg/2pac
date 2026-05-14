@@ -1,0 +1,6 @@
+* better plots
+* more plots
+* hover text for plots
+* plot old data
+* world.switch_to_state()
+* code re-org

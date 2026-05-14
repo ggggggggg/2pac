@@ -100,7 +100,7 @@ class StationWorld(World):
         update(self.datasaver, state)
 
 @state 
-def full_cycle_one_state(world: StationWorld):
+def he3_adr_cycle(world: StationWorld):
     testmode = False
     # 1. check that we're cold enough to start
     # 2. start heating charcoal
@@ -109,26 +109,20 @@ def full_cycle_one_state(world: StationWorld):
     # 5. cool charcoal
     # 6. ramp down adr
 
-    # 1. check that we're cold enough to start
-    while True:
-        mr = most_recent_measurements()
-        # print(mr)
-        # if mr["cryocon_chB_temperature"] > 5:
-        #     print("charcoal too hot")
-        #     continue
-
-        # if mr["cryocon_chC_temperature"] > 3.2:
-        #     print("3K plate too hot")
-        #     continue
-        world.wait(1)
-        break
-
+    # 1. set heat switches and check that we're cold enough to start
     world.station.labjack.heatswitch_pot("CLOSED")
     world.wait(1)
     world.station.labjack.heatswitch_adr("CLOSED")
     world.wait(1)
     world.station.labjack.heatswitch_charcoal("OPEN")
     world.wait(1)
+    while True:
+        mr = most_recent_measurements()
+        if mr["cryocon_chC_temperature"] < 3.2:
+            break
+        world.wait(1)
+
+
 
 
     # 2. start heating charcoal
@@ -159,7 +153,7 @@ def full_cycle_one_state(world: StationWorld):
         target_hout = 1 # small max current
         target_time_s = 30
     else:
-        target_hout= 55  # 55 should get to 9.53 A, which is the hardware current limit of the kepco supply
+        target_hout= 58.1  # 55 should get to 9.53 A, which is the hardware current limit of the kepco supply
         target_time_s = 30*60
     target_step_duration_s = 1
     target_N_steps = int(target_time_s/target_step_duration_s)
@@ -168,6 +162,8 @@ def full_cycle_one_state(world: StationWorld):
     for hout in houts_up:
         ramp_controller.out(hout)
         world.wait(target_step_duration_s)
+        print("CLOSE THE GREEN HE3 VALVE")
+
 
     # 4. wait for he3 to condense
     if testmode:
@@ -196,7 +192,7 @@ def full_cycle_one_state(world: StationWorld):
     if testmode:
         world.wait(10)
     else:
-        world.wait(3660*3)
+        world.wait(3660*1)
         world.station.cryocon.loop1_setpoint(65) # Upper stage setpoint = 45 K, trying higher so i t actually goes up?
         # our base temp is about 60K, so 45K does nothing
         # notices that if i head to 65 K then cool back down the He3 temp drops a lot
@@ -206,11 +202,17 @@ def full_cycle_one_state(world: StationWorld):
         world.station.cryocon.loop2_setpoint(1) # Charcoal setpoint = 1 K, AKA OFF
         world.wait(1)
         world.station.cryocon.control_enabled(True) # heat 40K stage
-        world.wait(3600*0.5) # takes about 2 hours
+        world.wait(3600*0.5) #
         world.station.cryocon.control_enabled(False) # turn off 40K heat after cooling pot
-        world.wait(3660*0.5)
+        world.wait(3660*2)
         # test based on seeing pot temp drop (400 mK to 300 mK)
         # after heating and cooling 40K stage 60K->65K->60K 
+
+    # while True:
+    #     mr = most_recent_measurements()
+    #     if mr["faa_temperature"] < 2: # paul said launching from 2k is somehow better than going colder, why?
+    #         break
+    #     world.wait(1)
 
     # 5. ramp down adr
     world.station.labjack.heatswitch_adr("OPEN")
@@ -224,10 +226,12 @@ def full_cycle_one_state(world: StationWorld):
     else:
         world.wait(20*60) # let magnet current get smaller
     world.station.labjack.relay("CONTROL")
-    # world.wait(1)
-    # ramp_controller.setpoint(0.05)
-    # world.wait(1)
-    # ramp_controller.mode('closed')
+    world.wait(30)
+    ramp_controller.mode('closed')
+    world.wait(1)
+    ramp_controller.setpoint(0.05)
+    world.wait(1)
+    ramp_controller.range("100uA")
 
 
     
@@ -260,6 +264,7 @@ def ready_for_cooldown(world:StationWorld):
     world.station.cryocon.loop2_source("B")
     world.station.cryocon.loop2_setpoint(55) # Charcoal setpoint = 55 K
     world.station.cryocon.control_enabled(False) 
+    print("OPEN THE GREEN HE3 VALVE")
     world.wait(1e6)
 
 @state
@@ -566,9 +571,9 @@ class MyApp(QWidget):
         right_layout.addLayout(self.status_layout)
 
         # Add a text input field
-        self.text_input = QLineEdit(self)
-        self.text_input.setPlaceholderText("Enter some text here...")
-        right_layout.addWidget(self.text_input)
+        # self.text_input = QLineEdit(self)
+        # self.text_input.setPlaceholderText("Enter some text here...")
+        # right_layout.addWidget(self.text_input)
 
         # Add right_layout to the main layout
         main_layout.addLayout(plot_layout)
@@ -630,9 +635,9 @@ def main():
         datasaver_global = datasaver
         world.datasaver = datasaver
 
-        states_list = [wait_forever, wait_forever2, switch_to_wait_forever_test, 
-                    warmup_300K, full_cycle_one_state,
-                    ready_for_cooldown, open_adr_heatswitch, set_relay_to_ramp]
+        states_list = [wait_forever, he3_adr_cycle, warmup_300K, ready_for_cooldown]
+        #wait_forever2, switch_to_wait_forever_test, 
+         #            open_adr_heatswitch, set_relay_to_ramp]
         states_dict = {state.name(): state for state in states_list}
         world._update(wait_forever)
         dataset = datasaver.dataset
