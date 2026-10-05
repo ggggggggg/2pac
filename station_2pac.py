@@ -21,9 +21,11 @@ def _make_station():
     lj = labjacku3.LabjackU3("labjack")
 
     station = Station()
-    station.add_component(ls)
-    station.add_component(cryocon)
-    station.add_component(lj)
+    # update_snapshot=False: avoid querying every instrument parameter at startup
+    # (the Cryocon alone has ~90 params with a 0.1 s query delay each).
+    station.add_component(ls, update_snapshot=False)
+    station.add_component(cryocon, update_snapshot=False)
+    station.add_component(lj, update_snapshot=False)
     return station
 
 _station = None

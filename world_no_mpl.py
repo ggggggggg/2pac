@@ -27,7 +27,7 @@ class World:
     last_update_time_s: float = field(default=None,init=False)
     time: Any = field(default = time, init=False)
     command: Union[Any, None] = None
-    target_tick_rate_s: int = 4
+    target_tick_rate_s: float = 1.0
     state_start_time: float = field(default=0.0, init=False)
     to_wait_for_process_line: float = 0.0
     # def wait(self, seconds):
@@ -53,6 +53,15 @@ class World:
 
     def state_elapsed_s(self):
         return self.time.time()-self.state_start_time
+
+    def switch_to_state(self, target_state):
+        """Programmatically switch state machine to a target state."""
+        if hasattr(self, "_data_thread") and self._data_thread is not None:
+            if isinstance(target_state, str):
+                self._data_thread.set_combo_value(target_state)
+            else:
+                self._data_thread.next_state = target_state
+                self._data_thread.paused = False
 
     def state_runner(self, state: State):
         self.command = None

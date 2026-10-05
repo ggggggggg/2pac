@@ -4,3 +4,29 @@
 * plot old data
 * world.switch_to_state()
 * code re-org
+
+NEW
+
+* better logging folder structure
+* time should show local time 
+* there should be a third tab where I can rename channel names to easy names to use like Pot, FAA, Charcoal and 4K.
+*Display channel values at the bottom of the GUI with persistent latest values in black and corresponding values in grey above it where the cursor is.
+* Left clicking the plot and holding down a square will zoom in to the region. mouse scrolling x and y axis will zoom those axes
+
+
+
+more
+
+* zooming plots should work better. scroll wheel on x should zoom x and same on y. dragging with left click should drag plots.
+* plots should occupy more of the window and have less whitespace around.
+* update plots every second.
+* handle time properly on x axis, dont show seconds.
+* dont add value of the channels to legend and to the title.
+* app takes long to launch
+* ability to pin gui launcher to the sidebar
+* the normal user only wants to go from wait_forever to ready_for_cooldown to start_he3_cycle to wait_forever and then warm up (which isn't included here). I think we should have a simple mode where we dont expose the scripting and a toggle for expert mode where the scripting comes in.
+    * also we dont want to see the functions with underscores. the states should be plaintext that the user can select
+    * app should be very robust for general user.
+* there should be a utils tab where we can set a few things
+    * logging interval
+

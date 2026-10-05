@@ -24,20 +24,47 @@ def collect_exits(source: str) -> list[str]:
 def insert_line_number_yields(source: str) -> str:
     new_source = ""
     i = 0
+    n_leading_whitespace = 0
+    in_triple_double = False
+    in_triple_single = False
+
     for line in source.splitlines():
         new_source += f"{line}\n"
-        stripped = line.lstrip()
-        if not len(line)==0:
-            # if the line is empty, use the last value for n_leading_whitespace
-            n_leading_whitespace = len(line) - len(stripped)
-        if stripped.startswith("def") or stripped.startswith("for") or stripped.startswith("if") or stripped.startswith("while") or stripped.startswith("else") or stripped.startswith("elif"):
-            n_leading_whitespace += 4
+        stripped = line.strip()
+
+        # Handle multiline string literals / docstrings
+        num_triple_double = stripped.count('"""')
+        num_triple_single = stripped.count("'''")
+        if num_triple_double % 2 != 0:
+            in_triple_double = not in_triple_double
+        if num_triple_single % 2 != 0:
+            in_triple_single = not in_triple_single
+
+        if in_triple_double or in_triple_single:
+            i += 1
+            continue
+
+        if not stripped or stripped.startswith("#") or stripped.startswith("@"):
+            i += 1
+            continue
+
+        line_indent = len(line) - len(line.lstrip())
+        n_leading_whitespace = line_indent
+
+        # Check if line opens a new block
+        clean_code = stripped.split("#")[0].rstrip()
+        if clean_code.endswith(":"):
+            n_leading_whitespace = line_indent + 4
+
+        # Skip yield after jump/terminating statements
+        if stripped in ("break", "continue", "pass") or stripped.startswith(("break ", "continue ", "pass ", "return", "raise")):
+            i += 1
+            continue
+
         whitespace = " " * n_leading_whitespace
-        if stripped.startswith("@") or stripped.startswith("#") or len(stripped)==0: # dont annotate decorator lines or comments
-            pass
-        else:
-            new_source += f"{whitespace}yield {i}\n"
-        i+=1
+        new_source += f"{whitespace}yield {i}\n"
+        i += 1
+
     return new_source
 
 def remove_decorators(source: str) -> str:
@@ -103,6 +130,7 @@ class State:
     raw_source: str
     new_source: str
     func_to_make_generator: Callable
+    display_source: str = None
 
     def run_until_complete(self) -> tuple[list[int], Union['State', None]]:
         gen = self.func_to_make_generator()
@@ -125,10 +153,18 @@ class State:
         return self.func_to_make_generator.__name__
     
     def code_line(self, line_number):
-        lines = self.raw_source.splitlines()
-        return lines[line_number]
+        src = self.display_source if self.display_source is not None else self.raw_source
+        lines = src.splitlines()
+        idx = line_number - 1 if self.display_source is not None else line_number
+        if 0 <= idx < len(lines):
+            return lines[idx]
+        return ""
     
     def code_highlighted(self, line_number):
-        return highlight_line(self.raw_source, line_number)
+        src = self.display_source if self.display_source is not None else self.raw_source
+        if self.display_source is not None:
+            idx = max(0, line_number - 1)
+            return highlight_line(src, idx)
+        return highlight_line(src, line_number)
 
 

@@ -4,8 +4,10 @@ from qcodes.utils.validators import Numbers, Enum, Ints, Bool
 
 # get parsers
 def floatk(x):
-    if x[-1]=="K":
-        return float(x[:-1])
+    x = x.strip()
+    if x and x[-1] in "Kk":
+        x = x[:-1]
+    return float(x)
 
 def strip(x):
     return x.strip()
@@ -97,7 +99,7 @@ class Cryocon24C(VisaInstrument):
                             vals=Enum('A', 'B', 'C', 'D'))
 
             self.add_parameter(l + 'setpoint',
-                            get_cmd='loop {loop}:setpt?',
+                            get_cmd=f'loop {loop}:setpt?',
                             get_parser=floatk,
                         #    set_cmd='loop {}:setpt {{}}'.format(loop),
                         # the cryocon returns a response to set commands, so we need to use ask
