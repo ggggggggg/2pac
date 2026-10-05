@@ -11,7 +11,7 @@ def _patched_sqlite3_connect(database, **kwargs):
 sqlite3.connect = _patched_sqlite3_connect
 from PyQt5.QtWidgets import QApplication, QSplashScreen
 from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont, QIcon
-from PyQt5.QtCore import Qt, QRectF
+from PyQt5.QtCore import Qt, QRectF, QTimer
 
 def create_splash_pixmap():
     pixmap = QPixmap(440, 200)
@@ -148,7 +148,34 @@ def main():
         if icon_path.exists():
             window.setWindowIcon(QIcon(str(icon_path)))
         window.show()
+        window.raise_()
+        window.activateWindow()
         splash.finish(window)
+
+        # Force window to foreground in X11 / GNOME Mutter over existing active windows (e.g. VSCode)
+        def bring_to_front():
+            window.setWindowState((window.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+            window.raise_()
+            window.activateWindow()
+            try:
+                import Xlib.display, Xlib.X, Xlib.protocol.event
+                d = Xlib.display.Display()
+                root = d.screen().root
+                net_active = d.intern_atom('_NET_ACTIVE_WINDOW')
+                ev = Xlib.protocol.event.ClientMessage(
+                    window=int(window.winId()),
+                    client_type=net_active,
+                    data=(32, [2, Xlib.X.CurrentTime, 0, 0, 0])
+                )
+                root.send_event(ev, event_mask=Xlib.X.SubstructureRedirectMask | Xlib.X.SubstructureNotifyMask)
+                d.sync()
+            except Exception:
+                pass
+
+        bring_to_front()
+        QTimer.singleShot(100, bring_to_front)
+        QTimer.singleShot(350, bring_to_front)
+
         sys.exit(app.exec_())
 
 if __name__ == "__main__":

@@ -1138,6 +1138,11 @@ class MyApp(QWidget):
         self.plot_timer.timeout.connect(self._on_plot_timer)
         self.plot_timer.start()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.raise_()
+        self.activateWindow()
+
     # ------------- Theming & Visual Styling ---------------
     def _set_status_badge(self, text, state_key):
         self.current_badge_state = state_key
@@ -1944,8 +1949,21 @@ Categories=Science;Utility;
                 else:
                     x_center = (cur_xlim[0] + cur_xlim[1]) / 2.0
 
-            new_xlim = [x_center - (x_center - cur_xlim[0]) * scale_factor,
-                        x_center + (cur_xlim[1] - x_center) * scale_factor]
+            # Guard against extreme zoom-in (< 1s) or extreme zoom-out (> 50 years)
+            MIN_SPAN_X = 1.0  # 1 second
+            MAX_SPAN_X = 50.0 * 365.25 * 86400.0  # 50 years
+
+            new_span = span_x * scale_factor
+            if scale_factor < 1.0 and span_x <= MIN_SPAN_X:
+                new_span = MIN_SPAN_X
+            elif scale_factor > 1.0 and span_x >= MAX_SPAN_X:
+                new_span = MAX_SPAN_X
+            else:
+                new_span = max(MIN_SPAN_X, min(MAX_SPAN_X, new_span))
+
+            frac_center = (x_center - cur_xlim[0]) / span_x if span_x > 0 else 0.5
+            new_xlim = [x_center - frac_center * new_span,
+                        x_center + (1.0 - frac_center) * new_span]
             for a in self.axes_list:
                 a.set_xlim(new_xlim)
 
@@ -2131,7 +2149,8 @@ Categories=Science;Utility;
 
         active_tw = "All Time" if (self.user_has_zoomed or self.displaying_historical) else self.time_window
         result = plot_dataset(self.figure, dataset, xloc_for_vals, filter_tab=self.active_plot_tab,
-                              temp_scale=self.temp_scale, time_window=active_tw, theme=self.theme)
+                              temp_scale=self.temp_scale, time_window=active_tw, theme=self.theme,
+                              custom_xlim=saved_xlim)
         data_mr, data_xloc, units, keys, self.axes_list = result
 
         if self.axes_list:

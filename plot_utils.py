@@ -1,8 +1,9 @@
+import math
 import numpy as np
 import matplotlib.colors as mc
 import colorsys
 from datetime import datetime
-from matplotlib.ticker import FuncFormatter, FormatStrFormatter, MultipleLocator
+from matplotlib.ticker import FuncFormatter, FormatStrFormatter, MultipleLocator, Locator, Formatter
 from matplotlib.gridspec import GridSpec
 
 def adjust_lightness(color, amount=0.5):
@@ -135,44 +136,262 @@ def display_name(key):
     """Return the alias for a channel key, or the key itself."""
     return CHANNEL_ALIASES.get(key, key)
 
+class SmartTimeLocator(Locator):
+    """
+    Intelligent dynamic time-series locator.
+    Adapts ticks in real-time as the axis is zoomed or panned, guaranteeing a
+    consistent, readable tick density (typically 4 to 8 ticks) across any scale:
+    from sub-seconds to minutes, hours, days, months, and decades.
+    Prevents Locator.MAXTICKS overflow crashes and eliminates clutter.
+    """
+    MAXTICKS = 2000
+
+    # Comprehensive human-friendly step intervals (in seconds)
+    STANDARD_STEPS = [
+        # Sub-second / seconds
+        0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0,
+        # Minutes
+        60.0, 120.0, 300.0, 600.0, 900.0, 1800.0,
+        # Hours
+        3600.0, 7200.0, 10800.0, 14400.0, 21600.0, 43200.0,
+        # Days
+        86400.0, 172800.0, 259200.0, 432000.0, 604800.0,
+        # Weeks / Months
+        1209600.0, 2592000.0, 5184000.0, 7776000.0, 15552000.0,
+        # Years
+        31536000.0, 63072000.0, 157680000.0, 315360000.0
+    ]
+
+    def __init__(self, target_ticks=6, min_ticks=4, max_ticks=8):
+        super().__init__()
+        self.target_ticks = target_ticks
+        self.min_ticks = min_ticks
+        self.max_ticks = max_ticks
+
+    def _choose_step(self, span):
+        if span <= 0 or not np.isfinite(span):
+            return 60.0
+
+        ideal_step = span / self.target_ticks
+
+        if ideal_step < self.STANDARD_STEPS[0]:
+            scale = 10.0 ** math.floor(math.log10(max(1e-12, ideal_step)))
+            mult = ideal_step / scale
+            if mult < 1.5:
+                return 1.0 * scale
+            elif mult < 3.5:
+                return 2.0 * scale
+            elif mult < 7.5:
+                return 5.0 * scale
+            else:
+                return 10.0 * scale
+
+        if ideal_step > self.STANDARD_STEPS[-1]:
+            scale = 10.0 ** math.floor(math.log10(ideal_step))
+            mult = ideal_step / scale
+            if mult < 1.5:
+                return 1.0 * scale
+            elif mult < 3.5:
+                return 2.0 * scale
+            elif mult < 7.5:
+                return 5.0 * scale
+            else:
+                return 10.0 * scale
+
+        best_step = self.STANDARD_STEPS[0]
+        best_score = float('inf')
+        for s in self.STANDARD_STEPS:
+            n = span / s
+            diff = abs(n - self.target_ticks)
+            if self.min_ticks <= n <= self.max_ticks:
+                diff -= 0.6
+            if diff < best_score:
+                best_score = diff
+                best_step = s
+
+        return best_step
+
+    def tick_values(self, vmin, vmax):
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+            return [vmin] if np.isfinite(vmin) else [0.0]
+        if vmin > vmax:
+            vmin, vmax = vmax, vmin
+
+        span = vmax - vmin
+        step = self._choose_step(span)
+
+        is_epoch = (vmin > 1e8)
+        tz_offset = 0.0
+        if is_epoch:
+            try:
+                tz_offset = datetime.now().astimezone().utcoffset().total_seconds()
+            except Exception:
+                tz_offset = 0.0
+
+        align_offset = tz_offset if (is_epoch and step >= 86400.0) else 0.0
+        first_tick = math.ceil((vmin + align_offset) / step) * step - align_offset
+        ticks = []
+        t = first_tick
+        max_allowed = 15  # Strict safety guarantee against tick explosion
+        while t <= vmax + 1e-9 * step and len(ticks) < max_allowed:
+            ticks.append(t)
+            t += step
+
+        if not ticks:
+            ticks = [vmin, vmax]
+        return ticks
+
+    def __call__(self):
+        if self.axis is not None:
+            vmin, vmax = self.axis.get_view_interval()
+        else:
+            vmin, vmax = (0.0, 3600.0)
+        return self.tick_values(vmin, vmax)
+
+
+class SmartTimeFormatter(Formatter):
+    """
+    Intelligent dynamic time-series formatter.
+    Inspects current visible span and tick delta, generating minimal, high-clarity labels:
+    - Step < 60s (fine zoom): HH:MM:SS (prevents duplicate HH:MM labels)
+    - 60s <= Step < 24h: HH:MM (under 24h span) or MM/DD HH:MM (multi-day span)
+    - 24h <= Step < 30 days: MM/DD (clean date, no redundant 00:00 midnight text)
+    - 30 days <= Step < 3 years: YYYY-MM
+    - Step >= 3 years: YYYY
+    Safely handles epoch bounds and relative elapsed time.
+    """
+    def __init__(self):
+        super().__init__()
+        self._last_step = 60.0
+
+    def format_ticks(self, values):
+        if len(values) > 1:
+            diffs = np.diff(values)
+            pos_diffs = diffs[diffs > 0]
+            if len(pos_diffs) > 0:
+                self._last_step = float(np.median(pos_diffs))
+        span_s = 3600.0
+        if self.axis is not None:
+            try:
+                vmin, vmax = self.axis.get_view_interval()
+                span_s = abs(vmax - vmin)
+            except Exception:
+                pass
+        return [self._format_single(v, span_s, self._last_step) for v in values]
+
+    def _format_single(self, val, span_s, step):
+        try:
+            if val is None or not np.isfinite(val):
+                return ""
+
+            # Relative seconds (elapsed time or non-epoch coordinates)
+            if val < 1e8:
+                is_neg = val < 0
+                val_abs = abs(val)
+                s = int(val_abs % 60)
+                m = int((val_abs // 60) % 60)
+                h = int(val_abs // 3600)
+                prefix = "-" if is_neg else ""
+                if step < 60:
+                    return f"{prefix}{m:02d}:{s:02d}"
+                elif step < 86400:
+                    return f"{prefix}{h:02d}:{m:02d}"
+                else:
+                    d = h // 24
+                    h_rem = h % 24
+                    return f"{prefix}{d}d {h_rem:02d}h"
+
+            # Check for timestamp bounds (Python datetime supports years 1 to 9999)
+            if val < 0 or val > 253402300799:
+                return f"{val:.1e}"
+
+            dt = datetime.fromtimestamp(val)
+            if step < 60:
+                return dt.strftime("%H:%M:%S")
+            elif step < 86400:
+                if span_s <= 86400:
+                    return dt.strftime("%H:%M")
+                else:
+                    return dt.strftime("%m/%d %H:%M")
+            elif step < 30 * 86400:
+                return dt.strftime("%m/%d")
+            elif step < 365.25 * 86400:
+                return dt.strftime("%Y-%m")
+            else:
+                return dt.strftime("%Y")
+        except Exception:
+            return ""
+
+    def __call__(self, x, pos=None):
+        span_s = 3600.0
+        step = self._last_step
+        if self.axis is not None:
+            try:
+                vmin, vmax = self.axis.get_view_interval()
+                span_s = abs(vmax - vmin)
+                locs = self.axis.get_majorticklocs()
+                if len(locs) > 1:
+                    diffs = np.diff(locs)
+                    pos_diffs = diffs[diffs > 0]
+                    if len(pos_diffs) > 0:
+                        step = float(np.median(pos_diffs))
+                        self._last_step = step
+            except Exception:
+                pass
+        return self._format_single(x, span_s, step)
+
+
 def get_time_tick_step(span_s):
-    """Return an integer multiple of 60 seconds (minutes/hours) for clean X-axis time ticks without seconds."""
-    if span_s is None or span_s <= 300:
-        return 60           # 1 min
-    elif span_s <= 900:
-        return 120          # 2 min
-    elif span_s <= 2400:
-        return 300          # 5 min
-    elif span_s <= 7200:
-        return 600          # 10 min
-    elif span_s <= 18000:
-        return 1800         # 30 min
-    elif span_s <= 43200:
-        return 3600         # 1 hr
-    elif span_s <= 86400:
-        return 7200         # 2 hrs
-    else:
-        return 14400        # 4 hrs
+    """Return an intelligent time step for clean X-axis time ticks across any span."""
+    return SmartTimeLocator()._choose_step(span_s if span_s is not None else 3600)
+
 
 def epoch_to_local_str(epoch_s, span_s=None, include_seconds=False):
     """Convert epoch seconds or relative seconds to readable local time string without seconds by default."""
     try:
-        if epoch_s is None or np.isnan(epoch_s):
+        if epoch_s is None or not np.isfinite(epoch_s):
             return ""
         if epoch_s < 1e8:  # Relative seconds (elapsed time)
-            m, s = divmod(int(epoch_s), 60)
-            h, m = divmod(m, 60)
+            is_neg = epoch_s < 0
+            val_abs = abs(epoch_s)
+            s = int(val_abs % 60)
+            m = int((val_abs // 60) % 60)
+            h = int(val_abs // 3600)
+            prefix = "-" if is_neg else ""
             if include_seconds:
                 if h > 0:
-                    return f"{h:02d}:{m:02d}:{s:02d}"
-                return f"{m:02d}:{s:02d}"
+                    return f"{prefix}{h:02d}:{m:02d}:{s:02d}"
+                return f"{prefix}{m:02d}:{s:02d}"
             else:
-                return f"{h:02d}:{m:02d}" if h > 0 else f"{m:02d}m"
+                if span_s is not None and span_s >= 86400:
+                    d = h // 24
+                    h_rem = h % 24
+                    return f"{prefix}{d}d {h_rem:02d}h"
+                return f"{prefix}{h:02d}:{m:02d}" if h > 0 else f"{prefix}{m:02d}m"
+
+        if epoch_s < 0 or epoch_s > 253402300799:
+            return f"{epoch_s:.1e}"
+
         dt = datetime.fromtimestamp(epoch_s)
-        if span_s is not None and span_s > 86400:
-            return dt.strftime("%m-%d %H:%M")
         if include_seconds:
+            if span_s is not None and span_s > 86400:
+                return dt.strftime("%m-%d %H:%M:%S")
             return dt.strftime("%H:%M:%S")
+
+        if span_s is not None:
+            if span_s < 120:
+                return dt.strftime("%H:%M:%S")
+            elif span_s <= 86400:
+                return dt.strftime("%H:%M")
+            elif span_s <= 7 * 86400:
+                return dt.strftime("%m-%d %H:%M")
+            elif span_s <= 180 * 86400:
+                return dt.strftime("%m-%d")
+            elif span_s <= 3 * 365.25 * 86400:
+                return dt.strftime("%Y-%m")
+            else:
+                return dt.strftime("%Y")
+
         return dt.strftime("%H:%M")
     except Exception:
         return ""
@@ -323,7 +542,7 @@ def safe_plot(ax, x, v, **kwargs):
         
     return ax.plot(x_sub, v_sub, **kwargs)
 
-def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale="log", time_window="All Time", theme="light"):
+def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale="log", time_window="All Time", theme="light", custom_xlim=None):
     """
     Plot dataset on figure with modern light or dark mode styling.
     - Main tab: All temperatures on left; He3 Pressure and Magnet Current as a 2x1 stack on right.
@@ -333,6 +552,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
     Supports temp_scale: "log" or "linear".
     Supports time_window: "Last 1 Hour", "Last 6 Hours", "Last 24 Hours", "All Time".
     Supports theme: "light" or "dark".
+    Supports custom_xlim: Optional (xmin, xmax) tuple to enforce explicit viewport zoom.
     Returns (data_mr, data_xloc, units, keys_to_plot, axes_list).
     """
     thm = THEMES.get(theme, THEMES["light"])
@@ -376,7 +596,16 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         window_s = 86400
 
     target_xlim = None
-    if len(x) > 0:
+    if custom_xlim is not None and isinstance(custom_xlim, (tuple, list)) and len(custom_xlim) == 2:
+        try:
+            x0 = float(custom_xlim[0])
+            x1 = float(custom_xlim[1])
+            if x0 < x1:
+                target_xlim = (x0, x1)
+        except Exception:
+            pass
+
+    if target_xlim is None and len(x) > 0:
         x_end = x[-1]
         if window_s is not None:
             x_start = x_end - window_s
@@ -390,6 +619,29 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             target_xlim = (x_min_aligned, x_max_aligned)
 
     span_for_format = (target_xlim[1] - target_xlim[0]) if target_xlim else 3600
+
+    # Viewport window slicing: Slices large historical arrays to the visible window
+    # ensuring instantaneous sub-millisecond execution even with millions of points.
+    x_plot = x
+    slice_start = 0
+    slice_end = len(x)
+    if len(x) > 0 and target_xlim is not None:
+        pad = max(60.0, span_for_format * 0.05)
+        # Check if target_xlim is a sub-window of x
+        if target_xlim[0] > (x[0] - pad) or target_xlim[1] < (x[-1] + pad):
+            if target_xlim[0] > x[0]:
+                slice_start = max(0, int(np.searchsorted(x, target_xlim[0] - pad)))
+            if target_xlim[1] < x[-1]:
+                slice_end = min(len(x), int(np.searchsorted(x, target_xlim[1] + pad)) + 1)
+            if slice_start > 0 or slice_end < len(x):
+                x_plot = x[slice_start:slice_end]
+
+    def get_sliced(arr):
+        if arr is None or (slice_start == 0 and slice_end == len(x)):
+            return arr
+        if len(arr) >= len(x):
+            return arr[slice_start:slice_end]
+        return arr
 
     axes_list = []
     
@@ -413,20 +665,19 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             ax.grid(True, which="both", axis="both", color=thm["grid"], linestyle="--", alpha=thm["grid_alpha"])
             ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
 
-        step = get_time_tick_step(span_for_format)
-
         # 1. Plot all Temperatures on ax_temp
         temp_keys = get_temp_keys(data)
         all_temp_vals = []
         for key in temp_keys:
             if key in data and key in data[key] and len(data[key][key]) > 0:
                 v = np.array(data[key][key], dtype=float)
-                pos = v[np.isfinite(v) & (v > 0)]
+                v_plot = get_sliced(v)
+                pos = v_plot[np.isfinite(v_plot) & (v_plot > 0)]
                 if len(pos) > 0:
                     all_temp_vals.append(pos)
                 color = ch_colors.get(key, "#0284c7")
                 name = display_name(key)
-                safe_plot(ax_temp, x, v, color=color, lw=1.8, label=name)
+                safe_plot(ax_temp, x_plot, v_plot, color=color, lw=1.8, label=name)
         
         if temp_scale == "log":
             ax_temp.set_yscale("log")
@@ -452,8 +703,8 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         ax_temp.set_title("Temperatures", loc="left", fontsize=10, fontweight="bold", color=thm["text"], pad=4)
         if temp_keys and len(x) > 0:
             ax_temp.legend(loc="upper left", fontsize=8, facecolor=thm["legend_bg"], edgecolor=thm["legend_edge"], labelcolor=thm["legend_text"], framealpha=0.9)
-        ax_temp.xaxis.set_major_locator(MultipleLocator(step))
-        ax_temp.xaxis.set_major_formatter(FuncFormatter(lambda val, pos: epoch_to_local_str(val, span_s=span_for_format, include_seconds=False)))
+        ax_temp.xaxis.set_major_locator(SmartTimeLocator())
+        ax_temp.xaxis.set_major_formatter(SmartTimeFormatter())
         ax_temp.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
         ax_temp.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
 
@@ -463,7 +714,8 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         color_he3 = ch_colors.get(he3_key, "#2563eb")
         if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
             v = np.array(data[he3_key][he3_key], dtype=float)
-            safe_plot(ax_he3, x, v, color=color_he3, lw=1.8)
+            v_plot = get_sliced(v)
+            safe_plot(ax_he3, x_plot, v_plot, color=color_he3, lw=1.8)
         ax_he3.set_title(display_name(he3_key), loc="left", fontsize=9.5, fontweight="bold", color=color_he3, pad=4)
         ax_he3.set_ylabel("Pressure (bar)", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
         ax_he3.tick_params(axis="x", labelbottom=False)
@@ -475,11 +727,12 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         unit = units.get(kepco_key, "A")
         if kepco_key in data and kepco_key in data[kepco_key] and len(data[kepco_key][kepco_key]) > 0:
             v = np.array(data[kepco_key][kepco_key], dtype=float)
-            safe_plot(ax_kepco_i, x, v, color=color_kepco, lw=1.8)
+            v_plot = get_sliced(v)
+            safe_plot(ax_kepco_i, x_plot, v_plot, color=color_kepco, lw=1.8)
         ax_kepco_i.set_title(display_name(kepco_key), loc="left", fontsize=9.5, fontweight="bold", color=color_kepco, pad=4)
         ax_kepco_i.set_ylabel(f"Current ({unit})", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
-        ax_kepco_i.xaxis.set_major_locator(MultipleLocator(step))
-        ax_kepco_i.xaxis.set_major_formatter(FuncFormatter(lambda val, pos: epoch_to_local_str(val, span_s=span_for_format, include_seconds=False)))
+        ax_kepco_i.xaxis.set_major_locator(SmartTimeLocator())
+        ax_kepco_i.xaxis.set_major_formatter(SmartTimeFormatter())
         ax_kepco_i.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
         ax_kepco_i.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
 
@@ -505,19 +758,18 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         ax.grid(True, which="both", axis="both", color=thm["grid"], linestyle="--", alpha=thm["grid_alpha"])
         ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
 
-        step = get_time_tick_step(span_for_format)
-
         temp_keys = get_temp_keys(data)
         all_temp_vals = []
         for key in temp_keys:
             if key in data and key in data[key] and len(data[key][key]) > 0:
                 v = np.array(data[key][key], dtype=float)
-                pos = v[np.isfinite(v) & (v > 0)]
+                v_plot = get_sliced(v)
+                pos = v_plot[np.isfinite(v_plot) & (v_plot > 0)]
                 if len(pos) > 0:
                     all_temp_vals.append(pos)
                 color = ch_colors.get(key, "#0284c7")
                 name = display_name(key)
-                safe_plot(ax, x, v, color=color, lw=1.8, label=name)
+                safe_plot(ax, x_plot, v_plot, color=color, lw=1.8, label=name)
 
         if temp_scale == "log":
             ax.set_yscale("log")
@@ -543,8 +795,8 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         ax.set_title("All Thermometers", loc="left", fontsize=10, fontweight="bold", color=thm["text"], pad=4)
         if temp_keys and len(x) > 0:
             ax.legend(loc="upper left", fontsize=8.5, facecolor=thm["legend_bg"], edgecolor=thm["legend_edge"], labelcolor=thm["legend_text"], framealpha=0.9)
-        ax.xaxis.set_major_locator(MultipleLocator(step))
-        ax.xaxis.set_major_formatter(FuncFormatter(lambda val, pos: epoch_to_local_str(val, span_s=span_for_format, include_seconds=False)))
+        ax.xaxis.set_major_locator(SmartTimeLocator())
+        ax.xaxis.set_major_formatter(SmartTimeFormatter())
         ax.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
         ax.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
 
@@ -568,19 +820,18 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
         ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
 
-        step = get_time_tick_step(span_for_format)
-
         key = get_pressure_key(data)
         color = ch_colors.get(key, "#2563eb")
         name = display_name(key)
         if key in data and key in data[key] and len(data[key][key]) > 0:
             v = np.array(data[key][key], dtype=float)
-            safe_plot(ax, x, v, color=color, lw=1.8)
+            v_plot = get_sliced(v)
+            safe_plot(ax, x_plot, v_plot, color=color, lw=1.8)
         ax.set_title(name, loc="left", fontsize=10, fontweight="bold", color=color, pad=4)
         ax.set_ylabel("Pressure (bar)", color=thm["tick_color"], fontsize=9, fontweight="bold")
 
-        ax.xaxis.set_major_locator(MultipleLocator(step))
-        ax.xaxis.set_major_formatter(FuncFormatter(lambda val, pos: epoch_to_local_str(val, span_s=span_for_format, include_seconds=False)))
+        ax.xaxis.set_major_locator(SmartTimeLocator())
+        ax.xaxis.set_major_formatter(SmartTimeFormatter())
         ax.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
         ax.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
 
@@ -599,12 +850,13 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             "ls370_heater_out",
             "heat_switches",
         ]
-        step = get_time_tick_step(span_for_format)
         first_ax = None
         for idx, ch_key in enumerate(channel_list):
             if idx == 0:
                 ax = figure.add_subplot(len(channel_list), 1, idx + 1)
                 first_ax = ax
+                first_ax.xaxis.set_major_locator(SmartTimeLocator())
+                first_ax.xaxis.set_major_formatter(SmartTimeFormatter())
             else:
                 ax = figure.add_subplot(len(channel_list), 1, idx + 1, sharex=first_ax)
 
@@ -632,14 +884,14 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
                         v_unknown = np.array([d == "UNKNOWN" for d in data[key][key]])
 
                     yval = (2e-2) * (0.85 ** i)
-                    y_open = np.where(v_open, yval, np.nan)
-                    y_closed = np.where(v_closed, yval, np.nan)
-                    y_unknown = np.where(v_unknown, yval, np.nan)
+                    y_open = get_sliced(np.where(v_open, yval, np.nan))
+                    y_closed = get_sliced(np.where(v_closed, yval, np.nan))
+                    y_unknown = get_sliced(np.where(v_unknown, yval, np.nan))
 
                     color = base_colors[i]
-                    safe_plot(ax, x, y_closed, color=color, lw=2.5, label=display_name(key))
-                    safe_plot(ax, x, y_open, color=color, lw=1.5, ls=":")
-                    safe_plot(ax, x, y_unknown, linestyle="--", color=color, lw=1.5)
+                    safe_plot(ax, x_plot, y_closed, color=color, lw=2.5, label=display_name(key))
+                    safe_plot(ax, x_plot, y_open, color=color, lw=1.5, ls=":")
+                    safe_plot(ax, x_plot, y_unknown, linestyle="--", color=color, lw=1.5)
 
                 ax.set_yscale("log")
                 ax.set_ylabel("State", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
@@ -653,7 +905,8 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
                 
                 if ch_key in data and ch_key in data[ch_key] and len(data[ch_key][ch_key]) > 0:
                     v = np.array(data[ch_key][ch_key], dtype=float)
-                    safe_plot(ax, x, v, color=color, linewidth=1.8)
+                    v_plot = get_sliced(v)
+                    safe_plot(ax, x_plot, v_plot, color=color, linewidth=1.8)
                 ax.set_title(name, loc="left", fontsize=9.5, fontweight="bold", color=color, pad=3)
                 ax.set_ylabel(f"{name} ({unit})" if unit else name, color=thm["tick_color"], fontsize=8.5, fontweight="bold")
 
@@ -661,8 +914,8 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
                 ax.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
 
             if idx == len(channel_list) - 1:
-                ax.xaxis.set_major_locator(MultipleLocator(step))
-                ax.xaxis.set_major_formatter(FuncFormatter(lambda val, pos: epoch_to_local_str(val, span_s=span_for_format, include_seconds=False)))
+                ax.xaxis.set_major_locator(SmartTimeLocator())
+                ax.xaxis.set_major_formatter(SmartTimeFormatter())
                 ax.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
                 ax.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
             else:

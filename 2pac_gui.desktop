@@ -1,11 +1,12 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=2PAC GUI
+Name=2pac gui
 Comment=Hardware Control GUI for 2pac ADR
 Exec=/home/pcuser/qsp/src/2pac/launch_gui.sh
 Path=/home/pcuser/qsp/src/2pac
 Icon=/home/pcuser/qsp/src/2pac/adr_gui_icon.png
 Terminal=false
 StartupWMClass=2pac_gui
+StartupNotify=true
 Categories=Utility;
