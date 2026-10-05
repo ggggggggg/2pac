@@ -1,0 +1,13 @@
+# Ready For Cooldown Script
+close heatswitch pot
+close heatswitch adr
+close heatswitch charcoal
+wait 3 s
+
+world.station.cryocon.loop1_source("A")
+world.station.cryocon.loop1_setpoint(45)
+world.station.cryocon.loop2_source("B")
+world.station.cryocon.loop2_setpoint(55)
+world.station.cryocon.control_enabled(False)
+print("OPEN THE GREEN HE3 VALVE")
+wait 1000000 s

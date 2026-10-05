@@ -1,10 +1,4 @@
-from pathlib import Path
-
-DESKTOP_DIR = Path.home() / "Desktop" / "custom_scripts"
-DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
-
-SCRIPTS = {
-    "he3_adr_cycle.txt": """# He3 ADR Cycle Custom Script
+# He3 ADR Cycle Custom Script
 # 1. Close heatswitches pot & adr, open charcoal, wait until pot < 3.2K
 close heatswitch pot
 wait 1 s
@@ -92,73 +86,3 @@ world.wait(1)
 ramp_controller.range("100uA")
 
 return wait_forever
-""",
-
-    "ready_for_cooldown.txt": """# Ready For Cooldown Script
-close heatswitch pot
-close heatswitch adr
-close heatswitch charcoal
-wait 3 s
-
-world.station.cryocon.loop1_source("A")
-world.station.cryocon.loop1_setpoint(45)
-world.station.cryocon.loop2_source("B")
-world.station.cryocon.loop2_setpoint(55)
-world.station.cryocon.control_enabled(False)
-print("OPEN THE GREEN HE3 VALVE")
-wait 1000000 s
-""",
-
-    "warmup_300K.txt": """# Warmup 300K Script
-close heatswitch pot
-close heatswitch adr
-close heatswitch charcoal
-wait 3 s
-
-world.station.cryocon.loop1_source("A")
-world.station.cryocon.loop1_setpoint(295)
-world.station.cryocon.loop2_source("B")
-world.station.cryocon.loop2_setpoint(295)
-world.station.cryocon.control_enabled(True)
-wait 1e15 s
-""",
-
-    "open_charcoal_heatswitch.txt": """# Open Charcoal Heat Switch
-open heatswitch charcoal
-return wait_forever
-""",
-
-    "open_pot_heatswitch.txt": """# Open Pot Heat Switch
-open heatswitch pot
-return wait_forever
-""",
-
-    "open_adr_heatswitch.txt": """# Open ADR Heat Switch
-open heatswitch adr
-return wait_forever
-""",
-
-    "set_relay_to_ramp.txt": """# Set Relay to RAMP
-set relay RAMP
-return wait_forever
-""",
-
-    "switch_to_wait_forever_test.txt": """# Switch to Wait Forever Test
-return wait_forever
-""",
-
-    "wait_forever.txt": """# Idle Wait Forever State
-while True:
-    world.wait(1)
-""",
-
-    "wait_forever2.txt": """# Extended Idle State
-world.wait(1e18)
-"""
-}
-
-for fname, content in SCRIPTS.items():
-    file_path = DESKTOP_DIR / fname
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(content.strip() + "\n")
-    print(f"Exported: {file_path}")

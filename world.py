@@ -7,7 +7,6 @@ from imperative_statemachine import state, State
 from typing import Callable, Union, Any
 import random
 import numpy as np
-import pylab as plt
 from nonblocking_readline import nonblocking_readline
 
 # how to compile function from text
@@ -30,8 +29,9 @@ class World:
     command: Union[Any, None] = None
     target_tick_rate_s: float = 1.0
     state_start_time: float = field(default=0.0, init=False)
-    def wait(self, seconds):
-        self.waiting_for = self.time.time() + seconds
+    to_wait_for_process_line: float = 0.0
+    # def wait(self, seconds):
+    #     self.waiting_for = self.time.time() + seconds
 
     # do not overload
     def _update(self, state):
@@ -64,6 +64,7 @@ class World:
                 self._data_thread.paused = False
 
     def state_runner(self, state: State):
+        self.command = None
         state_gen = state.func_to_make_generator(self)
         self.state_start_time = self.time.time()
         line_number = 0
@@ -111,9 +112,9 @@ class World:
             should_process_line = True
             return should_update, should_process_line    
         elif isinstance(self.command, WaitUntil):
-            to_wait_for_process_line = self.command.time_s-self.time.time()
+            self.to_wait_for_process_line = self.command.time_s-self.time.time()
             # print(f"{to_wait_for_process_line=}")
-            if to_wait_for_process_line<0:
+            if self.to_wait_for_process_line<0:
                 self.command = None
                 should_update = False
                 should_process_line = True
@@ -131,7 +132,7 @@ class World:
                     return should_update, should_process_line
 
 
-        plt.pause(to_wait_for_tick_s)
+        time.sleep(to_wait_for_tick_s)
         should_update = True
         should_process_line = False
         return should_update, should_process_line        

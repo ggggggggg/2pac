@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 from imperative_statemachine import state
-from world_no_mpl import World
+from world import World
 
 # Initialize globals to be populated by main.py
 st = None

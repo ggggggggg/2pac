@@ -121,12 +121,28 @@ def load_state_from_txt(txt_path: Path) -> tuple[str, State]:
     else:
         raise ValueError(f"Function {script_name} not found after compiling {txt_path.name}")
 
+REPO_SCRIPTS_DIR = Path(__file__).resolve().parent / "custom_scripts"
+
+def ensure_desktop_scripts_seeded():
+    """Ensure ~/Desktop/custom_scripts exists and is populated with templates from the repo."""
+    try:
+        DESKTOP_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+        if REPO_SCRIPTS_DIR.is_dir():
+            import shutil
+            for src in REPO_SCRIPTS_DIR.glob("*.txt"):
+                dest = DESKTOP_SCRIPTS_DIR / src.name
+                if not dest.exists():
+                    shutil.copy2(src, dest)
+    except Exception as e:
+        print(f"Notice: Could not auto-seed desktop custom scripts: {e}")
+
 def load_all_desktop_scripts() -> dict[str, State]:
     """
     Loads all .txt custom scripts from ~/Desktop/custom_scripts/.
+    Auto-seeds template scripts from repo on first run if directory is empty.
     Returns a dict mapping script_name -> State object.
     """
-    DESKTOP_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_desktop_scripts_seeded()
     custom_states = {}
     for p in sorted(DESKTOP_SCRIPTS_DIR.glob("*.txt")):
         try:

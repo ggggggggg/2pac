@@ -1,0 +1,12 @@
+# Warmup 300K Script
+close heatswitch pot
+close heatswitch adr
+close heatswitch charcoal
+wait 3 s
+
+world.station.cryocon.loop1_source("A")
+world.station.cryocon.loop1_setpoint(295)
+world.station.cryocon.loop2_source("B")
+world.station.cryocon.loop2_setpoint(295)
+world.station.cryocon.control_enabled(True)
+wait 1e15 s

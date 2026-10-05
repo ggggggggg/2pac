@@ -1,0 +1,2 @@
+# Extended Idle State
+world.wait(1e18)
