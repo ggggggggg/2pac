@@ -787,9 +787,17 @@ class MyApp(QWidget):
         self._drag_has_moved = False
 
         screen_geometry = QApplication.desktop().screenGeometry()
-        win_w = min(1440, screen_geometry.width())
-        win_h = min(900, int(0.85 * screen_geometry.height()))
-        self.setFixedSize(win_w, win_h)
+        saved_w = self.gui_settings.get("window_width")
+        saved_h = self.gui_settings.get("window_height")
+        if saved_w and saved_h:
+            win_w = max(950, min(int(saved_w), screen_geometry.width()))
+            win_h = max(600, min(int(saved_h), screen_geometry.height()))
+        else:
+            win_w = min(1440, screen_geometry.width())
+            win_h = min(900, int(0.85 * screen_geometry.height()))
+
+        self.resize(win_w, win_h)
+        self.setMinimumSize(950, 600)
         self.setWindowTitle("2pac gui — Idle")
         icon_path = Path(__file__).parent / "adr_gui_icon.png"
         if icon_path.exists():
@@ -1142,6 +1150,13 @@ class MyApp(QWidget):
         super().showEvent(event)
         self.raise_()
         self.activateWindow()
+
+    def closeEvent(self, event):
+        if not self.isMaximized() and not self.isMinimized():
+            self.gui_settings["window_width"] = self.width()
+            self.gui_settings["window_height"] = self.height()
+            save_gui_settings(self.gui_settings)
+        super().closeEvent(event)
 
     # ------------- Theming & Visual Styling ---------------
     def _set_status_badge(self, text, state_key):
