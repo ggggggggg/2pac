@@ -44,3 +44,4 @@ echo "Launcher location: $HOME/.local/share/applications/2pac_gui.desktop"
 if [ -d "$HOME/Desktop" ]; then
     echo "Desktop shortcut: $HOME/Desktop/2pac_gui.desktop"
 fi
+
