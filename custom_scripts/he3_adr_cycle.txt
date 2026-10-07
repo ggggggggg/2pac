@@ -1,4 +1,7 @@
 # He3 ADR Cycle Custom Script
+# 0. Close green valve check
+print("CLOSE THE GREEN HE3 VALVE")
+
 # 1. Close heatswitches pot & adr, open charcoal, wait until pot < 3.2K
 close heatswitch pot
 wait 1 s
@@ -43,7 +46,6 @@ houts_up = np.arange(target_N_steps) * step_size
 for hout in houts_up:
     ramp_controller.out(hout)
     world.wait(target_step_duration_s)
-    print("CLOSE THE GREEN HE3 VALVE")
 
 # 4. Wait for He3 to condense
 world.wait(12600)
@@ -55,7 +57,7 @@ world.station.cryocon.control_enabled(False)
 world.wait(120)
 close heatswitch charcoal
 world.wait(1)
-world.wait(3660)
+world.wait(3600)
 
 world.station.cryocon.loop1_setpoint(65)
 world.wait(1)
@@ -66,7 +68,7 @@ world.wait(1)
 world.station.cryocon.control_enabled(True)
 world.wait(1800)
 world.station.cryocon.control_enabled(False)
-world.wait(7320)
+world.wait(7200)
 
 # 6. Ramp down ADR
 open heatswitch adr

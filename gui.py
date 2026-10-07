@@ -3,11 +3,14 @@ import time
 import json
 import sqlite3
 import subprocess
+import threading
 from pathlib import Path
+from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QComboBox, QTextEdit, QLabel, QHBoxLayout,
                              QPushButton, QTabWidget, QMessageBox, QFileDialog, QGridLayout, QLineEdit,
                              QScrollArea, QFrame, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QListWidget, QListWidgetItem, QCheckBox, QSpinBox, QDoubleSpinBox, QFormLayout)
+                             QListWidget, QListWidgetItem, QCheckBox, QSpinBox, QDoubleSpinBox, QFormLayout,
+                             QProgressBar)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT
@@ -15,17 +18,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from states import wait_forever
-from plot_utils import plot_dataset, CHANNEL_ALIASES, CHANNEL_COLORS, display_name, THEMES
+from plot_utils import plot_dataset, CHANNEL_ALIASES, CHANNEL_COLORS, display_name, THEMES, format_cryo_temp
 
 SETTINGS_PATH = Path.home() / "2pac_logs" / "channel_aliases.json"
 
 DEFAULT_CHANNEL_ALIASES = {
-    "cryocon_chA_temperature": "4K",
+    "cryocon_chA_temperature": "40K flange",
     "cryocon_chB_temperature": "Charcoal",
-    "cryocon_chC_temperature": "Pot",
-    "cryocon_chD_temperature": "ChD",
+    "cryocon_chC_temperature": "4K flange",
+    "cryocon_chD_temperature": "Pot",
     "faa_temperature": "FAA",
     "labjack_he3_pressure": "He3 Pressure",
+    "vac_can_pressure_torr": "Vac Can Pressure",
     "labjack_kepco_current": "Magnet Current",
     "labjack_kepco_voltage": "Kepco V",
     "ls370_heater_out": "LS370 Heater",
@@ -41,7 +45,9 @@ DEFAULT_CHANNEL_ALIASES = {
 STATE_LABELS = {
     "wait_forever": "Idle",
     "ready_for_cooldown": "Ready for Cooldown",
+    "he3_only_cycle": "He-3 Cycle (No Magnet)",
     "he3_adr_cycle": "He-3 + ADR Cycle",
+    "ramp_down_magnet": "Ramp Down Magnet",
     "warmup_300K": "Warm Up to 300 K",
     "open_adr_heatswitch": "Open ADR Heat Switch",
     "open_charcoal_heatswitch": "Open Charcoal Heat Switch",
@@ -53,13 +59,24 @@ STATE_DESCRIPTIONS = {
     "wait_forever": "Log data only. No hardware changes.",
     "ready_for_cooldown": "Closes all heat switches and sets He-3 setpoints (heaters off).\n"
                           "You will be asked to open the green He-3 valve.",
-    "he3_adr_cycle": "Full He-3 / ADR cycle (several hours): heats charcoal, ramps the magnet up, "
-                     "condenses He-3, then ramps the magnet down.\nWaits until the pot is below 3.2 K before starting.",
-    "warmup_300K": "Closes all heat switches and heats the stages to 295 K.",
+    "he3_only_cycle": "He-3 condensation cycle (no magnet / no ADR):\n"
+                      "Waits for Pot < 3.2 K, heats charcoal (55 K), dwells 3.5 h, and cools charcoal to reach ~300 mK.",
+    "he3_adr_cycle": "Full He-3 / ADR cycle (several hours): heats charcoal, ramps magnet up, "
+                     "condenses He-3, then ramps magnet down.\nWaits until Pot < 3.2 K before starting.",
+    "ramp_down_magnet": "Safely ramps the magnet current from its current level down to 0 A at the standard safe rate.",
+    "warmup_300K": "Closes all heat switches and warms the cryostat to 295 K.\n"
+                   "You will be asked to open the green He-3 valve.",
 }
 
 # The normal operator sequence. Simple mode only offers these.
-SIMPLE_WORKFLOW = ["wait_forever", "ready_for_cooldown", "he3_adr_cycle", "warmup_300K"]
+SIMPLE_WORKFLOW = [
+    "wait_forever",
+    "ready_for_cooldown",
+    "he3_only_cycle",
+    "he3_adr_cycle",
+    "ramp_down_magnet",
+    "warmup_300K",
+]
 
 IDLE_STATE = "wait_forever"
 
@@ -590,6 +607,7 @@ PRIMARY_STATUS_KEYS = [
     "cryocon_chC_temperature",
     "faa_temperature",
     "labjack_he3_pressure",
+    "vac_can_pressure_torr",
     "labjack_kepco_current",
 ]
 
@@ -704,12 +722,18 @@ class DataFetchThread(QThread):
                     if self.next_state is not None:
                         break
 
+                    pause_start = time.time()
                     while self.paused and self.next_state is None and self.running:
                         time.sleep(max(0.1, self.world.target_tick_rate_s))
                         self.world._update(state)
                         elapsed = self.world.last_update_time_s - tstart
                         s1 = f"state={state.name()} [PAUSED] {line_number=} {elapsed=:.2f}"
                         self.state_update.emit(s1, state.code_highlighted(line_number))
+
+                    if hasattr(self.world, "command") and self.world.command is not None:
+                        from world import WaitUntil
+                        if isinstance(self.world.command, WaitUntil):
+                            self.world.command.time_s += (time.time() - pause_start)
 
                     if self.next_state is not None:
                         break
@@ -720,11 +744,12 @@ class DataFetchThread(QThread):
                     s2 = state.code_highlighted(line_number)
                     self.state_update.emit(s1, s2)
 
-                    # Check for valve instruction in he3_adr_cycle
-                    if state.name() == "he3_adr_cycle":
-                        code_line = state.code_line(line_number)
-                        if "CLOSE THE GREEN HE3 VALVE" in code_line:
-                            self.operator_action.emit("he3_adr_cycle", "⚠️ ACTION REQUIRED: Close the green He-3 valve on the cryostat.")
+                    # Check for valve instruction in active state
+                    code_line = state.code_line(line_number)
+                    if "CLOSE THE GREEN HE3 VALVE" in code_line:
+                        self.operator_action.emit(state.name(), "⚠️ ACTION REQUIRED: Ensure the green He-3 valve on the cryostat is CLOSED.")
+                    elif "OPEN THE GREEN HE3 VALVE" in code_line:
+                        self.operator_action.emit(state.name(), "⚠️ ACTION REQUIRED: Open the green He-3 valve on the cryostat.")
 
                 # If runner exited naturally without next_state being set
                 if self.next_state is None and self.running:
@@ -749,7 +774,17 @@ class DataFetchThread(QThread):
 
 
 class MyApp(QWidget):
-    def __init__(self, world, dataset, states_dict):
+    @property
+    def live_dataset(self):
+        if hasattr(self, "daily_logger") and self.daily_logger and getattr(self.daily_logger, "dataset", None) is not None:
+            return self.daily_logger.dataset
+        return getattr(self, "_initial_dataset", None)
+
+    @live_dataset.setter
+    def live_dataset(self, val):
+        self._initial_dataset = val
+
+    def __init__(self, world, dataset, states_dict, daily_logger=None):
         super().__init__()
 
         load_aliases()
@@ -758,6 +793,7 @@ class MyApp(QWidget):
         self.expert_mode = bool(self.gui_settings.get("expert_mode", False))
 
         self.world = world
+        self.daily_logger = daily_logger
         self.world.target_tick_rate_s = float(self.gui_settings.get("log_interval_s", 1.0))
         import states as states_module
         states_module.ENABLE_TEXT_LOGGING = bool(self.gui_settings.get("text_logs", True))
@@ -770,12 +806,41 @@ class MyApp(QWidget):
         self.current_badge_state = "idle"
         self.active_plot_tab = "Overview"
         self.temp_scale = "log"
-        self.time_window = self.gui_settings.get("default_range", "6 Hours")
+        saved_range = self.gui_settings.get("default_range", "6 Hours")
+        if "1" in str(saved_range) and "24" not in str(saved_range):
+            self.time_window = "1 Hour"
+        elif "24" in str(saved_range):
+            self.time_window = "24 Hours"
+        elif "7" in str(saved_range) or "week" in str(saved_range).lower() or "all" in str(saved_range).lower():
+            self.time_window = "7 Days"
+        else:
+            self.time_window = "6 Hours"
         self.user_has_zoomed = False
         self.previewing_state = None
         self.axes_list = []
         self.on_mouse_move_event = None
         self.db_file_path = None
+        self.hidden_channels = set()
+        self._latest_magnet_current = 0.0
+
+        # Mechanical heat switch state tracking (Pot, ADR, Charcoal)
+        # Default all to CLOSED because cooldown script is actively running
+        self._hs_states = {"pot": "CLOSED", "adr": "CLOSED", "charcoal": "CLOSED"}
+        self._hs_pulsing = set()
+        try:
+            from daily_logger import get_last_hardware_state
+            last_hw_init = get_last_hardware_state()
+            if last_hw_init and "heatswitches" in last_hw_init:
+                self._hs_states.update(last_hw_init["heatswitches"])
+        except Exception:
+            pass
+
+        # Sync QCoDeS parameter caches without pulsing hardware relays
+        if hasattr(self.world, "station") and hasattr(self.world.station, "labjack"):
+            for _k in ("pot", "adr", "charcoal"):
+                _p = getattr(self.world.station.labjack, f"heatswitch_{_k}", None)
+                if _p and hasattr(_p, "cache"):
+                    _p.cache.set(self._hs_states.get(_k, "CLOSED"))
 
         # Left-click drag & pan state
         self._drag_active = False
@@ -817,13 +882,71 @@ class MyApp(QWidget):
         self.lbl_operator_action = QLabel("")
         self.lbl_operator_action.setFont(QFont("Segoe UI", 10, QFont.Bold))
         self.lbl_operator_action.setWordWrap(True)
+        self.btn_confirm_action = QPushButton("✔ Confirm Step Done")
+        self.btn_confirm_action.setObjectName("btn_confirm_action")
+        self.btn_confirm_action.setStyleSheet("background-color: #16a34a; color: white; font-weight: bold; border-radius: 4px; padding: 4px 12px;")
+        self.btn_confirm_action.clicked.connect(self.confirm_operator_action)
         self.btn_dismiss_banner = QPushButton("Dismiss")
-        self.btn_dismiss_banner.setFixedWidth(80)
+        self.btn_dismiss_banner.setFixedWidth(75)
         self.btn_dismiss_banner.clicked.connect(self.dismiss_operator_banner)
         banner_layout.addWidget(self.lbl_operator_action, stretch=1)
+        banner_layout.addWidget(self.btn_confirm_action)
         banner_layout.addWidget(self.btn_dismiss_banner)
         self.operator_banner.setVisible(False)
         outer_layout.addWidget(self.operator_banner)
+
+        # ================= Top Metric Readout Cards (5 Key Metrics) =================
+        self.metric_cards_bar = QFrame()
+        self.metric_cards_bar.setObjectName("metric_cards_bar")
+        self.metric_cards_bar.setFixedHeight(66)
+        metric_bar_layout = QHBoxLayout(self.metric_cards_bar)
+        metric_bar_layout.setContentsMargins(2, 2, 2, 2)
+        metric_bar_layout.setSpacing(6)
+
+        self.metric_tiles = {}
+        # Colors matched exactly to corresponding plot curves:
+        # FAA (Crimson Red #dc2626), Pot (Purple #7c3aed), Charcoal (Forest Green #059669),
+        # He-3 Pressure (Royal Blue #2563eb), Magnet Current (Deep Cyan #0891b2)
+        metric_specs = [
+            ("faa_temperature", "FAA STAGE", "#dc2626"),
+            ("cryocon_chD_temperature", "HE-3 POT", "#7c3aed"),
+            ("cryocon_chB_temperature", "CHARCOAL", "#059669"),
+            ("labjack_he3_pressure", "HE-3 PRESSURE", "#2563eb"),
+            ("labjack_kepco_current", "MAGNET CURRENT", "#0891b2"),
+        ]
+
+        for key, title, accent_color in metric_specs:
+            tile_card = QFrame()
+            tile_card.setObjectName("metric_tile")
+            tl = QVBoxLayout(tile_card)
+            tl.setContentsMargins(10, 5, 10, 5)
+            tl.setSpacing(1)
+
+            lbl_t = QLabel(title)
+            lbl_t.setObjectName("metric_tile_title")
+            lbl_t.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            lbl_t.setStyleSheet("color: rgba(255, 255, 255, 0.92); font-weight: 700; font-size: 11px; background: transparent;")
+
+            lbl_v = QLabel("—")
+            lbl_v.setObjectName("metric_tile_value")
+            lbl_v.setFont(QFont("Consolas", 16, QFont.Bold))
+            lbl_v.setStyleSheet("color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;")
+
+            tl.addWidget(lbl_t)
+            tl.addWidget(lbl_v)
+            tile_card.setStyleSheet(
+                f"QFrame#metric_tile {{ background-color: {accent_color}; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.18); }}"
+            )
+            metric_bar_layout.addWidget(tile_card)
+            self.metric_tiles[key] = {
+                "card": tile_card,
+                "lbl_t": lbl_t,
+                "val": lbl_v,
+                "accent": accent_color,
+                "title": title
+            }
+
+        outer_layout.addWidget(self.metric_cards_bar)
 
         main_layout = QHBoxLayout()
         main_layout.setSpacing(4)
@@ -867,9 +990,52 @@ class MyApp(QWidget):
         sidebar_layout.addWidget(self.btn_pause)
         sidebar_layout.addWidget(self.btn_stop)
 
-        self.btn_toggle_mode = QPushButton("Mode: Expert" if self.expert_mode else "Mode: Simple")
-        self.btn_toggle_mode.clicked.connect(self.toggle_expert_mode)
-        sidebar_layout.addWidget(self.btn_toggle_mode)
+        # --- Procedure Phase / Sub-Step Tracker ---
+        self.phase_box = QFrame()
+        self.phase_box.setObjectName("phase_box")
+        phase_layout = QVBoxLayout(self.phase_box)
+        phase_layout.setContentsMargins(5, 5, 5, 5)
+        phase_layout.setSpacing(2)
+
+        self.lbl_phase_title = QLabel("PROCEDURE PHASE:")
+        self.lbl_phase_title.setFont(QFont("Segoe UI", 7, QFont.Bold))
+
+        self.lbl_phase_name = QLabel("Idle — Holding Steady")
+        self.lbl_phase_name.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        self.lbl_phase_name.setWordWrap(True)
+
+        self.lbl_phase_time = QLabel("Holding steady")
+        self.lbl_phase_time.setFont(QFont("Consolas", 8))
+        self.lbl_phase_time.setStyleSheet("color: #0284c7;")
+
+        self.phase_progress_bar = QProgressBar()
+        self.phase_progress_bar.setFixedHeight(6)
+        self.phase_progress_bar.setTextVisible(False)
+        self.phase_progress_bar.setRange(0, 100)
+        self.phase_progress_bar.setValue(100)
+
+        phase_layout.addWidget(self.lbl_phase_title)
+        phase_layout.addWidget(self.lbl_phase_name)
+        phase_layout.addWidget(self.lbl_phase_time)
+        phase_layout.addWidget(self.phase_progress_bar)
+        sidebar_layout.addWidget(self.phase_box)
+
+        mode_box = QHBoxLayout()
+        mode_box.setSpacing(4)
+        mode_box.setContentsMargins(0, 2, 0, 2)
+
+        self.btn_mode_simple = QPushButton("Simple")
+        self.btn_mode_simple.setToolTip("Simple Mode: streamlined safe procedures with a clean interface.")
+        self.btn_mode_simple.clicked.connect(lambda: self.toggle_expert_mode(False))
+        mode_box.addWidget(self.btn_mode_simple)
+
+        self.btn_mode_expert = QPushButton("Expert")
+        self.btn_mode_expert.setToolTip("Expert Mode: show Scripts editor and full list of low-level states.")
+        self.btn_mode_expert.clicked.connect(lambda: self.toggle_expert_mode(True))
+        mode_box.addWidget(self.btn_mode_expert)
+
+        self.btn_toggle_mode = self.btn_mode_simple  # Backward compatibility alias
+        sidebar_layout.addLayout(mode_box)
 
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.HLine)
@@ -900,6 +1066,49 @@ class MyApp(QWidget):
         self.btn_reset_zoom = QPushButton("Reset Zoom")
         self.btn_reset_zoom.clicked.connect(self.reset_zoom)
         sidebar_layout.addWidget(self.btn_reset_zoom)
+
+        # Separator above Heat Switches
+        sep_hs = QFrame()
+        sep_hs.setFrameShape(QFrame.HLine)
+        sep_hs.setFrameShadow(QFrame.Sunken)
+        sep_hs.setObjectName("separator")
+        sidebar_layout.addWidget(sep_hs)
+
+        # ================= Heat Switches Control (Bottom Left) =================
+        self.hs_box = QFrame()
+        self.hs_box.setObjectName("heatswitch_box")
+        hs_layout = QVBoxLayout(self.hs_box)
+        hs_layout.setContentsMargins(0, 2, 0, 2)
+        hs_layout.setSpacing(4)
+
+        self.lbl_hs_title = QLabel("HEAT SWITCHES")
+        self.lbl_hs_title.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        self.lbl_hs_title.setObjectName("muted_label")
+        hs_layout.addWidget(self.lbl_hs_title)
+
+        self.btn_hs_pot = QPushButton("● Pot: CLOSED")
+        self.btn_hs_pot.setObjectName("btn_hs_pot")
+        self.btn_hs_pot.setCursor(Qt.PointingHandCursor)
+        self.btn_hs_pot.setToolTip("Pot Heat Switch (Click to toggle). Closed = thermal link engaged, Open = isolated.")
+        self.btn_hs_pot.clicked.connect(lambda: self.on_heatswitch_clicked("pot", "Pot"))
+
+        self.btn_hs_adr = QPushButton("● ADR: CLOSED")
+        self.btn_hs_adr.setObjectName("btn_hs_adr")
+        self.btn_hs_adr.setCursor(Qt.PointingHandCursor)
+        self.btn_hs_adr.setToolTip("ADR Heat Switch (Click to toggle). Closed = thermal link engaged, Open = isolated.")
+        self.btn_hs_adr.clicked.connect(lambda: self.on_heatswitch_clicked("adr", "ADR"))
+
+        self.btn_hs_charcoal = QPushButton("● Charcoal: CLOSED")
+        self.btn_hs_charcoal.setObjectName("btn_hs_charcoal")
+        self.btn_hs_charcoal.setCursor(Qt.PointingHandCursor)
+        self.btn_hs_charcoal.setToolTip("Charcoal Heat Switch (Click to toggle). Closed = thermal link engaged, Open = isolated.")
+        self.btn_hs_charcoal.clicked.connect(lambda: self.on_heatswitch_clicked("charcoal", "Charcoal"))
+
+        hs_layout.addWidget(self.btn_hs_pot)
+        hs_layout.addWidget(self.btn_hs_adr)
+        hs_layout.addWidget(self.btn_hs_charcoal)
+
+        sidebar_layout.addWidget(self.hs_box)
 
         main_layout.addWidget(sidebar_frame)
 
@@ -935,15 +1144,27 @@ class MyApp(QWidget):
 
         self.combo_time_window = QComboBox()
         self.combo_time_window.wheelEvent = lambda event: None
-        self.combo_time_window.addItems(["1 Hour", "6 Hours", "24 Hours", "All Time"])
-        self.combo_time_window.setCurrentText("6 Hours")
+        self.combo_time_window.addItems(["1 Hour", "6 Hours", "24 Hours", "7 Days"])
+        self.combo_time_window.setCurrentText(self.time_window)
         self.combo_time_window.currentTextChanged.connect(self.on_time_window_changed)
+        self.combo_time_window.activated.connect(lambda idx: self.on_time_window_changed(self.combo_time_window.itemText(idx)))
         plot_ctrl_bar.addWidget(self.combo_time_window)
 
         plot_ctrl_bar.addSpacing(6)
         self.btn_toggle_temp_scale = QPushButton("Log Scale")
         self.btn_toggle_temp_scale.clicked.connect(self.toggle_temp_scale)
         plot_ctrl_bar.addWidget(self.btn_toggle_temp_scale)
+
+        self.btn_subkelvin_filter = QPushButton("🔍 Sub-Kelvin")
+        self.btn_subkelvin_filter.setCheckable(True)
+        self.btn_subkelvin_filter.setToolTip("Toggle to isolate sub-Kelvin stages (Pot & FAA) and rescale Y-axis")
+        self.btn_subkelvin_filter.clicked.connect(self.toggle_subkelvin_filter)
+        plot_ctrl_bar.addWidget(self.btn_subkelvin_filter)
+
+        self.btn_snapshot = QPushButton("📷 Snapshot")
+        self.btn_snapshot.setToolTip("Export 8-panel cooldown snapshot to ~/2pac_logs/snapshots/")
+        self.btn_snapshot.clicked.connect(self.export_plot_snapshot)
+        plot_ctrl_bar.addWidget(self.btn_snapshot)
 
         self.btn_theme_toggle = QPushButton("Light")
         self.btn_theme_toggle.clicked.connect(self.toggle_theme)
@@ -954,6 +1175,9 @@ class MyApp(QWidget):
         self.figure = plt.Figure(figsize=(10, 8))
         self.canvas = FigureCanvas(self.figure)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        for action in self.toolbar.actions():
+            if action.text() in ("Subplots", "Customize"):
+                self.toolbar.removeAction(action)
 
         plot_ctrl_bar.addWidget(self.toolbar)
         graphs_layout.addLayout(plot_ctrl_bar)
@@ -1051,7 +1275,7 @@ class MyApp(QWidget):
         db_layout.setSpacing(6)
 
         db_top_bar = QHBoxLayout()
-        lbl_db_hdr = QLabel("Run History")
+        lbl_db_hdr = QLabel("Daily Logs History")
         lbl_db_hdr.setObjectName("section_header")
         db_top_bar.addWidget(lbl_db_hdr)
         db_top_bar.addStretch()
@@ -1064,14 +1288,14 @@ class MyApp(QWidget):
         self.btn_refresh_db.clicked.connect(self.populate_db_table)
         db_top_bar.addWidget(self.btn_refresh_db)
 
-        self.btn_load_selected_run = QPushButton("Load Run")
+        self.btn_load_selected_run = QPushButton("Load Day")
         self.btn_load_selected_run.clicked.connect(self.load_selected_db_run)
         db_top_bar.addWidget(self.btn_load_selected_run)
         db_layout.addLayout(db_top_bar)
 
         self.db_table = QTableWidget()
         self.db_table.setColumnCount(4)
-        self.db_table.setHorizontalHeaderLabels(["Run ID", "Experiment", "Points", "Timestamp"])
+        self.db_table.setHorizontalHeaderLabels(["Date", "Data Points", "Time Span", "Size"])
         self.db_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.db_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.db_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1125,8 +1349,27 @@ class MyApp(QWidget):
         # Initial DB population
         self.populate_db_table()
 
+        # Startup hardware state recovery check
+        from daily_logger import get_last_hardware_state
+        last_hw = get_last_hardware_state()
+        if last_hw and last_hw.get("magnet_current", 0.0) > 0.1:
+            prev_i = last_hw["magnet_current"]
+            self.show_operator_banner(f"ℹ Magnet energized at {prev_i:.3f} A. Hardware settings held safely from previous session.")
+
         # Thread setup with completion, error, and operator alert hooks
-        self.data_thread = DataFetchThread(world, first_state=wait_forever, states_dict=states_dict)
+        active_proc = last_hw.get("active_procedure", "") if last_hw else ""
+        first_st = wait_forever
+        if active_proc == "ready_for_cooldown" and "ready_for_cooldown" in states_dict:
+            first_st = states_dict["ready_for_cooldown"]
+            idx = self.combo_box.findData("ready_for_cooldown")
+            if idx >= 0:
+                self.combo_box.blockSignals(True)
+                self.combo_box.setCurrentIndex(idx)
+                self.combo_box.blockSignals(False)
+            self._set_status_badge("RUNNING", "running")
+            self.lbl_script_name.setText(f"Active Script: {state_label('ready_for_cooldown')}")
+
+        self.data_thread = DataFetchThread(world, first_state=first_st, states_dict=states_dict)
         self.data_thread.state_update.connect(self.state_update)
         self.data_thread.procedure_finished.connect(self._on_procedure_finished)
         self.data_thread.procedure_error.connect(self._on_procedure_error)
@@ -1152,10 +1395,66 @@ class MyApp(QWidget):
         self.activateWindow()
 
     def closeEvent(self, event):
+        # 1. Quench Protection / Elevated Magnet Current Check
+        magnet_current = abs(getattr(self, "_latest_magnet_current", 0.0))
+        cur_state = self.current_selected_state_key()
+        is_active_procedure = (cur_state != IDLE_STATE and cur_state is not None)
+
+        if magnet_current > 0.1 or is_active_procedure:
+            msg = (
+                f"⚠️ Active Hardware / Magnet Current Warning\n\n"
+                f"Magnet current is currently elevated at: {magnet_current:.3f} A\n"
+                f"Active procedure: {state_label(cur_state)}\n\n"
+                "IMPORTANT: Closing the application will leave all physical instrument "
+                "settings HELD at their current values (no reset commands will be sent). "
+                "The Lake Shore 370 DAC, Cryo-con, and Kepco supply will continue holding current, "
+                "but automated software ramps will stop advancing.\n\n"
+                "Are you sure you want to close the GUI and hold settings?"
+            )
+            reply = QMessageBox.warning(
+                self,
+                "Confirm Exit — Hold Instrument Settings",
+                msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+
+        # 2. Persist hardware state snapshot for safe recovery
+        from daily_logger import save_hardware_state
+        try:
+            recent = {}
+            if hasattr(self, "live_dataset") and self.live_dataset:
+                data = self.live_dataset.cache.data()
+                for k in ("faa_temperature", "cryocon_chA_temperature", "cryocon_chB_temperature", "cryocon_chC_temperature", "cryocon_chD_temperature", "labjack_he3_pressure"):
+                    if k in data and k in data[k] and len(data[k][k]) > 0:
+                        recent[k] = float(data[k][k][-1])
+            save_hardware_state(
+                magnet_current=magnet_current,
+                he3_pressure=recent.get("labjack_he3_pressure", 0.0),
+                active_procedure=cur_state or IDLE_STATE,
+                phase_name=getattr(self.world, "current_phase", "Holding steady"),
+                temperatures=recent,
+                heatswitches=self._hs_states
+            )
+        except Exception as e:
+            print(f"Warning saving hardware state on close: {e}")
+
+        # 3. Flush daily logger
+        if hasattr(self, "daily_logger") and self.daily_logger:
+            try:
+                self.daily_logger.flush()
+            except Exception:
+                pass
+
+        # 4. Save window geometry
         if not self.isMaximized() and not self.isMinimized():
             self.gui_settings["window_width"] = self.width()
             self.gui_settings["window_height"] = self.height()
             save_gui_settings(self.gui_settings)
+
         super().closeEvent(event)
 
     # ------------- Theming & Visual Styling ---------------
@@ -1202,15 +1501,39 @@ class MyApp(QWidget):
         self._style_temp_scale_btn()
 
         if is_light:
-            self.btn_theme_toggle.setText("Light")
+            self.btn_theme_toggle.setText("Dark")
             self.btn_theme_toggle.setStyleSheet("background-color: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; font-weight: 500; padding: 4px 10px; border-radius: 4px;")
             self.lbl_cursor_vals.setStyleSheet("color: #64748b;")
             self.lbl_latest_vals.setStyleSheet("color: #0f172a;")
+            self.metric_cards_bar.setStyleSheet("background-color: transparent;")
+            self.phase_box.setStyleSheet("background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;")
+            self.lbl_phase_title.setStyleSheet("color: #64748b;")
+            self.lbl_phase_name.setStyleSheet("color: #0f172a;")
+            self.btn_snapshot.setStyleSheet("background-color: #ffffff; color: #475569; border: 1px solid #cbd5e1; font-weight: 500; padding: 4px 10px; border-radius: 4px;")
         else:
-            self.btn_theme_toggle.setText("Dark")
+            self.btn_theme_toggle.setText("Light")
             self.btn_theme_toggle.setStyleSheet("background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; font-weight: 500; padding: 4px 10px; border-radius: 4px;")
             self.lbl_cursor_vals.setStyleSheet("color: #94a3b8;")
             self.lbl_latest_vals.setStyleSheet("color: #f8fafc;")
+            self.metric_cards_bar.setStyleSheet("background-color: transparent;")
+            self.phase_box.setStyleSheet("background-color: #0f172a; border: 1px solid #1e293b; border-radius: 6px;")
+            self.lbl_phase_title.setStyleSheet("color: #94a3b8;")
+            self.lbl_phase_name.setStyleSheet("color: #f8fafc;")
+            self.btn_snapshot.setStyleSheet("background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; font-weight: 500; padding: 4px 10px; border-radius: 4px;")
+
+        # Digital metric tiles styling — filled solid with plot line colors and white text
+        for key, spec in self.metric_tiles.items():
+            acc = spec["accent"]
+            spec["card"].setStyleSheet(
+                f"QFrame#metric_tile {{ background-color: {acc}; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.18); }}"
+            )
+            if "lbl_t" in spec:
+                spec["lbl_t"].setStyleSheet("color: rgba(255, 255, 255, 0.92); font-weight: 700; font-size: 11px; background: transparent;")
+            spec["val"].setStyleSheet("color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;")
+
+        self._style_subkelvin_btn()
+        self._style_mode_btn()
+        self._update_heatswitch_ui()
 
         self._set_status_badge(self.lbl_status_badge.text(), getattr(self, "current_badge_state", "idle"))
         self._set_data_source_badge(not self.displaying_historical)
@@ -1220,63 +1543,125 @@ class MyApp(QWidget):
 
         self.update_plot()
 
+    def _style_subkelvin_btn(self):
+        is_light = (self.theme == "light")
+        if self.btn_subkelvin_filter.isChecked():
+            if is_light:
+                self.btn_subkelvin_filter.setStyleSheet("background-color: #0284c7; color: white; border: 1px solid #0284c7; font-weight: 600; padding: 4px 10px; border-radius: 4px;")
+            else:
+                self.btn_subkelvin_filter.setStyleSheet("background-color: #38bdf8; color: #0f172a; border: 1px solid #38bdf8; font-weight: 600; padding: 4px 10px; border-radius: 4px;")
+        else:
+            if is_light:
+                self.btn_subkelvin_filter.setStyleSheet("background-color: #ffffff; color: #0284c7; border: 1px solid #0284c7; font-weight: 600; padding: 4px 10px; border-radius: 4px;")
+            else:
+                self.btn_subkelvin_filter.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #38bdf8; font-weight: 600; padding: 4px 10px; border-radius: 4px;")
+
+    def toggle_subkelvin_filter(self):
+        if self.btn_subkelvin_filter.isChecked():
+            self.hidden_channels = {
+                "cryocon_chA_temperature",
+                "cryocon_chB_temperature",
+                "cryocon_chC_temperature"
+            }
+            self.btn_subkelvin_filter.setText("👁 All Stages")
+        else:
+            self.hidden_channels = set()
+            self.btn_subkelvin_filter.setText("🔍 Sub-Kelvin")
+        self._style_subkelvin_btn()
+        self.update_plot()
+
+    def export_plot_snapshot(self, *args, bypass_popup=False):
+        from datetime import datetime
+        now = datetime.now()
+        dt_str = now.strftime("%Y-%m-%d_%H-%M-%S")
+
+        snapshots_dir = Path.home() / "2pac_logs" / "snapshots"
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        out_path = snapshots_dir / f"snapshot_{dt_str}.png"
+        alt_path = snapshots_dir / f"{dt_str}.png"
+
+        dataset = self.historical_dataset if self.displaying_historical else self.live_dataset
+        if dataset is None:
+            if not bypass_popup:
+                QMessageBox.warning(self, "Snapshot Error", "No active dataset available to snapshot.")
+            return
+
+        # Get the currently displayed x-limits ("Only the current data with the xrange shown")
+        saved_xlim = self.axes_list[0].get_xlim() if (self.axes_list and len(self.axes_list) > 0) else None
+
+        try:
+            from plot_utils import export_snapshot_plot
+            export_snapshot_plot(dataset, out_path, xlim=saved_xlim)
+
+            # Also provide copy titled directly with datetime format YYYY-MM-DD_HH-MM-SS.png
+            try:
+                import shutil
+                shutil.copy2(str(out_path), str(alt_path))
+            except Exception:
+                pass
+
+            QApplication.beep()
+            msg = f"📸 Snapshot saved: {out_path.name}"
+            self.lbl_latest_vals.setText(msg)
+            if not bypass_popup:
+                QMessageBox.information(
+                    self,
+                    "Plot Snapshot Exported",
+                    f"8-panel publication plot exported to:\n\n{out_path}\n\nVisible window data preserved."
+                )
+        except Exception as e:
+            if not bypass_popup:
+                QMessageBox.warning(self, "Snapshot Error", f"Could not export snapshot: {e}")
+            else:
+                print(f"[MyApp] Snapshot export error: {e}")
+
+    def confirm_operator_action(self):
+        QApplication.beep()
+        self.dismiss_operator_banner()
+
     def toggle_theme(self):
         self.theme = "dark" if self.theme == "light" else "light"
         self.apply_theme()
 
-    # ------------- Database Explorer Methods ---------------
+    # ------------- Database / Daily Logs Explorer Methods ---------------
     def choose_db_file(self):
         options = QFileDialog.Options()
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select qcodes Database", str(Path.home() / "2pac_logs"), "Database Files (*.db);;All Files (*)", options=options)
+        file_name, _ = QFileDialog.getOpenFileName(self, "Select Log Database or Directory", str(Path.home() / "2pac_logs"), "Database Files (*.db);;All Files (*)", options=options)
         if file_name:
             self.db_file_path = file_name
-            self.populate_db_table()
+            try:
+                from daily_logger import load_daily_dataset
+                ds = load_daily_dataset(file_name)
+                self.historical_dataset = ds
+                self.displaying_historical = True
+                date_tag = Path(file_name).parent.name if Path(file_name).is_file() else Path(file_name).name
+                self._set_data_source_badge(False, f"● {date_tag}")
+                self.btn_live_data.setEnabled(True)
+                self.user_has_zoomed = False
+                self.update_plot()
+                self.main_tabs.setCurrentWidget(self.graphs_tab)
+            except Exception as e:
+                QMessageBox.warning(self, "Load Error", f"Failed to load dataset:\n\n{e}")
 
     def populate_db_table(self):
-        if self.db_file_path is None:
-            from datetime import datetime
-            today = datetime.now().strftime("%Y-%m-%d")
-            default_db = Path.home() / "2pac_logs" / today / "2pac.db"
-            if default_db.exists():
-                self.db_file_path = str(default_db)
-            else:
-                db_files = sorted(Path.home().glob("2pac_logs/**/*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
-                if db_files:
-                    self.db_file_path = str(db_files[0])
-
-        if not self.db_file_path or not Path(self.db_file_path).exists():
-            self.db_table.setRowCount(0)
-            return
-
+        from daily_logger import list_daily_logs
         try:
-            conn = sqlite3.connect(self.db_file_path)
-            c = conn.cursor()
-            c.execute("SELECT run_id, name, result_table_name, run_timestamp FROM runs ORDER BY run_id DESC")
-            rows = c.fetchall()
+            entries = list_daily_logs()
+            self._daily_log_entries = entries
+            self.db_table.setRowCount(len(entries))
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            for row_idx, item in enumerate(entries):
+                d_str = item["date"]
+                disp_date = f"{d_str} (Today)" if d_str == today_str else d_str
+                pts_str = f"{item['points']:,}" if item['points'] > 0 else "0"
+                size_str = f"{item['size_mb']:.1f} MB"
 
-            valid_runs = []
-            for run_id, name, table_name, timestamp in rows:
-                try:
-                    c.execute(f'SELECT max(rowid) FROM "{table_name}"')
-                    res = c.fetchone()
-                    cnt = res[0] if res and res[0] is not None else 0
-                    if cnt > 0:
-                        from plot_utils import epoch_to_local_str
-                        t_str = epoch_to_local_str(timestamp) if timestamp else ""
-                        valid_runs.append((run_id, name, cnt, t_str))
-                except Exception:
-                    pass
-            conn.close()
-
-            self.db_table.setRowCount(len(valid_runs))
-            for row_idx, (r_id, name, cnt, t_str) in enumerate(valid_runs):
-                self.db_table.setItem(row_idx, 0, QTableWidgetItem(str(r_id)))
-                self.db_table.setItem(row_idx, 1, QTableWidgetItem(str(name)))
-                self.db_table.setItem(row_idx, 2, QTableWidgetItem(f"{cnt:,}"))
-                self.db_table.setItem(row_idx, 3, QTableWidgetItem(str(t_str)))
-
+                self.db_table.setItem(row_idx, 0, QTableWidgetItem(disp_date))
+                self.db_table.setItem(row_idx, 1, QTableWidgetItem(pts_str))
+                self.db_table.setItem(row_idx, 2, QTableWidgetItem(item["time_range"]))
+                self.db_table.setItem(row_idx, 3, QTableWidgetItem(size_str))
         except Exception as e:
-            print(f"Error populating DB table: {e}")
+            print(f"Error populating daily logs table: {e}")
 
     def on_db_row_double_click(self, item):
         self.load_selected_db_run()
@@ -1284,27 +1669,25 @@ class MyApp(QWidget):
     def load_selected_db_run(self):
         selected_items = self.db_table.selectedItems()
         if not selected_items:
-            QMessageBox.information(self, "Select Run", "Please select a run from the table first.")
+            QMessageBox.information(self, "Select Day", "Please select a day from the table first.")
             return
 
         row = selected_items[0].row()
-        run_id_item = self.db_table.item(row, 0)
-        if not run_id_item:
-            return
-
-        run_id = int(run_id_item.text())
-        try:
-            import qcodes
-            qcodes.initialise_or_create_database_at(self.db_file_path)
-            self.historical_dataset = qcodes.load_by_id(run_id)
-            self.displaying_historical = True
-            self._set_data_source_badge(False, f"● Run #{run_id}")
-            self.btn_live_data.setEnabled(True)
-            self.user_has_zoomed = False
-            self.update_plot()
-            self.main_tabs.setCurrentWidget(self.graphs_tab)
-        except Exception as e:
-            QMessageBox.warning(self, "Load Error", f"Failed to load dataset:\n\n{e}")
+        if hasattr(self, "_daily_log_entries") and row < len(self._daily_log_entries):
+            entry = self._daily_log_entries[row]
+            date_str = entry["date"]
+            try:
+                from daily_logger import load_daily_dataset
+                ds = load_daily_dataset(date_str)
+                self.historical_dataset = ds
+                self.displaying_historical = True
+                self._set_data_source_badge(False, f"● Day {date_str}")
+                self.btn_live_data.setEnabled(True)
+                self.user_has_zoomed = False
+                self.update_plot()
+                self.main_tabs.setCurrentWidget(self.graphs_tab)
+            except Exception as e:
+                QMessageBox.warning(self, "Load Error", f"Failed to load daily dataset for {date_str}:\n\n{e}")
 
     # ------------- Channels Aliases & Script Loader ---------------
     def save_channel_aliases(self):
@@ -1358,32 +1741,78 @@ class MyApp(QWidget):
                 return k
         return None
 
+    def _style_mode_btn(self):
+        if not hasattr(self, "btn_mode_simple") or not hasattr(self, "btn_mode_expert"):
+            return
+        is_light = (self.theme == "light")
+        if self.expert_mode:
+            self.btn_mode_simple.setChecked(False)
+            self.btn_mode_expert.setChecked(True)
+            if is_light:
+                self.btn_mode_simple.setStyleSheet(
+                    "QPushButton { background-color: #ffffff; color: #64748b; border: 1px solid #cbd5e1; font-weight: 500; padding: 4px; border-radius: 4px; }"
+                    "QPushButton:hover { background-color: #f1f5f9; color: #0f172a; }"
+                )
+                self.btn_mode_expert.setStyleSheet(
+                    "QPushButton { background-color: #0284c7; color: #ffffff; border: 1px solid #0284c7; font-weight: 700; padding: 4px; border-radius: 4px; }"
+                )
+            else:
+                self.btn_mode_simple.setStyleSheet(
+                    "QPushButton { background-color: #1e293b; color: #94a3b8; border: 1px solid #334155; font-weight: 500; padding: 4px; border-radius: 4px; }"
+                    "QPushButton:hover { background-color: #334155; color: #f8fafc; }"
+                )
+                self.btn_mode_expert.setStyleSheet(
+                    "QPushButton { background-color: #38bdf8; color: #0f172a; border: 1px solid #38bdf8; font-weight: 700; padding: 4px; border-radius: 4px; }"
+                )
+        else:
+            self.btn_mode_simple.setChecked(True)
+            self.btn_mode_expert.setChecked(False)
+            if is_light:
+                self.btn_mode_simple.setStyleSheet(
+                    "QPushButton { background-color: #16a34a; color: #ffffff; border: 1px solid #16a34a; font-weight: 700; padding: 4px; border-radius: 4px; }"
+                )
+                self.btn_mode_expert.setStyleSheet(
+                    "QPushButton { background-color: #ffffff; color: #64748b; border: 1px solid #cbd5e1; font-weight: 500; padding: 4px; border-radius: 4px; }"
+                    "QPushButton:hover { background-color: #f1f5f9; color: #0f172a; }"
+                )
+            else:
+                self.btn_mode_simple.setStyleSheet(
+                    "QPushButton { background-color: #22c55e; color: #0f172a; border: 1px solid #22c55e; font-weight: 700; padding: 4px; border-radius: 4px; }"
+                )
+                self.btn_mode_expert.setStyleSheet(
+                    "QPushButton { background-color: #1e293b; color: #94a3b8; border: 1px solid #334155; font-weight: 500; padding: 4px; border-radius: 4px; }"
+                    "QPushButton:hover { background-color: #334155; color: #f8fafc; }"
+                )
+
     def toggle_expert_mode(self, enabled=None):
         if enabled is None:
             self.expert_mode = not self.expert_mode
         else:
             self.expert_mode = bool(enabled)
 
+        print(f"[MODE] Mode switched to: {'Expert' if self.expert_mode else 'Simple'}")
         self.gui_settings["expert_mode"] = self.expert_mode
         save_gui_settings(self.gui_settings)
 
-        self.btn_toggle_mode.setText("Mode: Expert" if self.expert_mode else "Mode: Simple")
+        self._style_mode_btn()
         if hasattr(self, "chk_expert_mode") and self.chk_expert_mode.isChecked() != self.expert_mode:
             self.chk_expert_mode.blockSignals(True)
             self.chk_expert_mode.setChecked(self.expert_mode)
             self.chk_expert_mode.blockSignals(False)
 
-        self.btn_reload_scripts.setVisible(self.expert_mode)
+        if hasattr(self, "btn_reload_scripts"):
+            self.btn_reload_scripts.setVisible(self.expert_mode)
 
         if self.expert_mode:
-            if self.main_tabs.indexOf(self.scripting_tab) == -1:
+            if hasattr(self, "scripting_tab") and self.main_tabs.indexOf(self.scripting_tab) == -1:
                 self.main_tabs.insertTab(1, self.scripting_tab, "Scripts")
         else:
-            idx = self.main_tabs.indexOf(self.scripting_tab)
-            if idx != -1:
-                if self.main_tabs.currentIndex() == idx:
-                    self.main_tabs.setCurrentWidget(self.graphs_tab)
-                self.main_tabs.removeTab(idx)
+            if hasattr(self, "scripting_tab"):
+                idx = self.main_tabs.indexOf(self.scripting_tab)
+                if idx != -1:
+                    if self.main_tabs.currentIndex() == idx:
+                        self.main_tabs.setCurrentWidget(self.graphs_tab)
+                    self.main_tabs.removeTab(idx)
 
         self._populate_state_combo()
 
@@ -1396,6 +1825,10 @@ class MyApp(QWidget):
 
     def _on_operator_action(self, state_name, text):
         self.show_operator_banner(text)
+        try:
+            QApplication.beep()
+        except Exception:
+            pass
 
     def _on_procedure_finished(self, state_name):
         self._set_status_badge("IDLE", "idle")
@@ -1415,7 +1848,14 @@ class MyApp(QWidget):
             self.combo_box.setCurrentIndex(idx)
             self.combo_box.blockSignals(False)
         self.lbl_script_name.setText(f"Active Script: {state_label(IDLE_STATE)}")
-        self.show_operator_banner(f"⚠️ Error in {state_label(state_name)}: {err_msg}. Reverted safely to Idle.")
+        mag_I = abs(getattr(self, "_latest_magnet_current", 0.0))
+        if mag_I > 0.2:
+            self.show_operator_banner(
+                f"⚠️ Error in {state_label(state_name)}: {err_msg}. "
+                f"WARNING: Magnet current is held at {mag_I:.3f} A! Run 'Ramp Down Magnet' to de-energize safely."
+            )
+        else:
+            self.show_operator_banner(f"⚠️ Error in {state_label(state_name)}: {err_msg}. Reverted safely to Idle.")
 
     def _build_utils_tab(self):
         tab = QWidget()
@@ -1460,7 +1900,7 @@ class MyApp(QWidget):
         telemetry_form.addRow("Text Log Files:", self.chk_text_logging)
 
         self.combo_default_range = QComboBox()
-        self.combo_default_range.addItems(["1 Hour", "6 Hours", "24 Hours", "All Time"])
+        self.combo_default_range.addItems(["1 Hour", "6 Hours", "24 Hours", "7 Days"])
         self.combo_default_range.setCurrentText(self.gui_settings.get("default_range", "6 Hours"))
         self.combo_default_range.currentTextChanged.connect(self._on_default_range_changed)
         telemetry_form.addRow("Default Time Range:", self.combo_default_range)
@@ -1562,6 +2002,13 @@ class MyApp(QWidget):
     def _on_default_range_changed(self, val):
         self.gui_settings["default_range"] = str(val)
         save_gui_settings(self.gui_settings)
+        if hasattr(self, "combo_time_window") and self.combo_time_window.currentText() != str(val):
+            self.combo_time_window.blockSignals(True)
+            self.combo_time_window.setCurrentText(str(val))
+            self.combo_time_window.blockSignals(False)
+        self.time_window = str(val)
+        self.user_has_zoomed = False
+        self.update_plot()
 
     def pin_to_dock(self):
         try:
@@ -1642,6 +2089,243 @@ Categories=Science;Utility;
         except Exception as e:
             QMessageBox.warning(self, "Reload Error", f"Failed to reload desktop scripts:\n\n{e}")
 
+    # ------------- Heat Switches Control ---------------
+    def _update_heatswitch_ui(self):
+        if not hasattr(self, "btn_hs_pot") or not hasattr(self, "btn_hs_adr") or not hasattr(self, "btn_hs_charcoal"):
+            return
+        is_light = (self.theme == "light")
+        switches = [
+            ("pot", "Pot", self.btn_hs_pot),
+            ("adr", "ADR", self.btn_hs_adr),
+            ("charcoal", "Charcoal", self.btn_hs_charcoal),
+        ]
+        for key, name, btn in switches:
+            st = self._hs_states.get(key, "CLOSED")
+            if st == "CLOSED":
+                # Lit = Closed (Conductive thermal link engaged)
+                btn.setText(f"● {name}: CLOSED")
+                if is_light:
+                    btn.setStyleSheet(
+                        "QPushButton {"
+                        "  background-color: #16a34a;"
+                        "  color: #ffffff;"
+                        "  border: 1px solid #15803d;"
+                        "  border-radius: 4px;"
+                        "  font-weight: 700;"
+                        "  font-size: 11px;"
+                        "  padding: 6px 4px;"
+                        "}"
+                        "QPushButton:hover {"
+                        "  background-color: #15803d;"
+                        "}"
+                    )
+                else:
+                    btn.setStyleSheet(
+                        "QPushButton {"
+                        "  background-color: #15803d;"
+                        "  color: #f0fdf4;"
+                        "  border: 1px solid #4ade80;"
+                        "  border-radius: 4px;"
+                        "  font-weight: 700;"
+                        "  font-size: 11px;"
+                        "  padding: 6px 4px;"
+                        "}"
+                        "QPushButton:hover {"
+                        "  background-color: #16a34a;"
+                        "}"
+                    )
+            elif st == "OPEN":
+                # Unlit = Open (Thermally isolated)
+                btn.setText(f"○ {name}: OPEN")
+                if is_light:
+                    btn.setStyleSheet(
+                        "QPushButton {"
+                        "  background-color: #f1f5f9;"
+                        "  color: #64748b;"
+                        "  border: 1px solid #cbd5e1;"
+                        "  border-radius: 4px;"
+                        "  font-weight: 600;"
+                        "  font-size: 11px;"
+                        "  padding: 6px 4px;"
+                        "}"
+                        "QPushButton:hover {"
+                        "  background-color: #e2e8f0;"
+                        "  color: #0f172a;"
+                        "}"
+                    )
+                else:
+                    btn.setStyleSheet(
+                        "QPushButton {"
+                        "  background-color: #1e293b;"
+                        "  color: #94a3b8;"
+                        "  border: 1px solid #334155;"
+                        "  border-radius: 4px;"
+                        "  font-weight: 600;"
+                        "  font-size: 11px;"
+                        "  padding: 6px 4px;"
+                        "}"
+                        "QPushButton:hover {"
+                        "  background-color: #334155;"
+                        "  color: #f8fafc;"
+                        "}"
+                    )
+            else:
+                # Unknown state
+                btn.setText(f"❓ {name}: UNKNOWN")
+                if is_light:
+                    btn.setStyleSheet(
+                        "QPushButton {"
+                        "  background-color: #fef3c7;"
+                        "  color: #92400e;"
+                        "  border: 1px solid #f59e0b;"
+                        "  border-radius: 4px;"
+                        "  font-weight: 700;"
+                        "  font-size: 11px;"
+                        "  padding: 6px 4px;"
+                        "}"
+                        "QPushButton:hover {"
+                        "  background-color: #fde68a;"
+                        "}"
+                    )
+                else:
+                    btn.setStyleSheet(
+                        "QPushButton {"
+                        "  background-color: #78350f;"
+                        "  color: #fef3c7;"
+                        "  border: 1px solid #d97706;"
+                        "  border-radius: 4px;"
+                        "  font-weight: 700;"
+                        "  font-size: 11px;"
+                        "  padding: 6px 4px;"
+                        "}"
+                        "QPushButton:hover {"
+                        "  background-color: #92400e;"
+                        "}"
+                    )
+
+    def is_script_running(self):
+        """Returns True if an active procedure (not idle/wait_forever) is currently executing."""
+        if hasattr(self, "data_thread") and self.data_thread and self.data_thread.state:
+            cur_name = self.data_thread.state.name()
+            if cur_name and cur_name not in (IDLE_STATE, "wait_forever", "wait_forever2"):
+                return True
+        return getattr(self, "current_badge_state", "idle") in ("running", "paused")
+
+    def on_heatswitch_clicked(self, switch_key, display_label, bypass_confirm=False):
+        """
+        Operator clicked a heat switch button. Toggles between OPEN and CLOSED.
+        If a procedure is running or magnet is energized, requires explicit confirmation.
+        """
+        current_state = self._hs_states.get(switch_key, "CLOSED")
+        target_state = "OPEN" if current_state == "CLOSED" else "CLOSED"
+
+        mag_I = abs(getattr(self, "_latest_magnet_current", 0.0))
+        if switch_key == "adr" and mag_I > 0.2 and not bypass_confirm:
+            reply = QMessageBox.warning(
+                self,
+                "⚠️ High Magnet Current — ADR Heat Switch Warning",
+                f"DANGER: Magnet current is currently elevated at {mag_I:.3f} A!\n\n"
+                f"Toggling the ADR heat switch while magnet current is flowing can cause severe "
+                f"thermal shock, rapid stage heating, or a magnet quench.\n\n"
+                f"Are you absolutely certain you want to toggle the ADR heat switch to {target_state}?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        elif not bypass_confirm and self.is_script_running():
+            cur_script = (
+                state_label(self.data_thread.state.name())
+                if (self.data_thread and self.data_thread.state)
+                else "Active Procedure"
+            )
+            action_word = "OPEN" if target_state == "OPEN" else "CLOSE"
+            consequence = (
+                "Opening this switch breaks thermal contact and thermally isolates the stage."
+                if target_state == "OPEN" else
+                "Closing this switch establishes a direct thermal conduction path."
+            )
+            msg = (
+                f"⚠️ Active Procedure Running: '{cur_script}'\n\n"
+                f"Do you really want to {action_word} the {display_label} heat switch?\n\n"
+                f"{consequence}\n\n"
+                f"Warning: Manually overriding heat switches during an active cycle "
+                f"can disrupt the temperature profile or cooldown process."
+            )
+            reply = QMessageBox.question(
+                self,
+                f"Confirm Heat Switch Override — {display_label}",
+                msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self.set_heatswitch_state(switch_key, target_state)
+
+    def set_heatswitch_state(self, switch_key, target_state):
+        """Update switch state, refresh UI button immediately, and pulse physical relay."""
+        if switch_key in self._hs_pulsing:
+            print(f"[HeatSwitch] {switch_key} is currently pulsing, ignoring duplicate trigger.")
+            return
+
+        self._hs_states[switch_key] = target_state
+        self._update_heatswitch_ui()
+
+        # Update QCoDeS parameter cache immediately for instant telemetry reflection
+        param_name = f"heatswitch_{switch_key}"
+        if hasattr(self.world, "station") and hasattr(self.world.station, "labjack"):
+            param = getattr(self.world.station.labjack, param_name, None)
+            if param and hasattr(param, "cache"):
+                param.cache.set(target_state)
+
+        # Pulse hardware latching relay in background daemon thread
+        def _pulse_hardware():
+            self._hs_pulsing.add(switch_key)
+            try:
+                if hasattr(self.world, "station") and hasattr(self.world.station, "labjack"):
+                    param = getattr(self.world.station.labjack, param_name, None)
+                    if param:
+                        param(target_state)
+                        print(f"[HeatSwitch] Physical pulse executed: {param_name} -> {target_state}")
+            except Exception as e:
+                print(f"[HeatSwitch] Error pulsing hardware relay for {switch_key}: {e}")
+            finally:
+                self._hs_pulsing.discard(switch_key)
+
+        threading.Thread(target=_pulse_hardware, daemon=True).start()
+
+        # Persist updated switch state to disk
+        from daily_logger import save_hardware_state
+        try:
+            cur_state = self.current_selected_state_key() or IDLE_STATE
+            save_hardware_state(
+                magnet_current=abs(getattr(self, "_latest_magnet_current", 0.0)),
+                he3_pressure=getattr(self, "_latest_he3_pressure", 0.0),
+                active_procedure=cur_state,
+                phase_name=getattr(self.world, "current_phase", "Holding steady"),
+                heatswitches=self._hs_states
+            )
+        except Exception:
+            pass
+
+    def sync_heatswitch_states_from_hardware(self):
+        """Synchronize button states if an automated procedure modifies them in the background."""
+        changed = False
+        for key in ("pot", "adr", "charcoal"):
+            param_name = f"heatswitch_{key}"
+            if hasattr(self.world, "station") and hasattr(self.world.station, "labjack"):
+                param = getattr(self.world.station.labjack, param_name, None)
+                if param:
+                    val = str(param())
+                    if val in ("OPEN", "CLOSED") and val != self._hs_states.get(key):
+                        self._hs_states[key] = val
+                        changed = True
+        if changed:
+            self._update_heatswitch_ui()
+
     # ------------- State Control ---------------
     def _check_external_commands(self):
         cmd_file = Path("/tmp/2pac_gui_command.txt")
@@ -1709,11 +2393,35 @@ Categories=Science;Utility;
                     self.stop_state(bypass_confirm=True)
                 elif cmd == "dismiss_banner":
                     self.dismiss_operator_banner()
+                elif cmd.startswith("operator_action:"):
+                    act_txt = cmd.split("operator_action:")[1].strip()
+                    self._on_operator_action("procedure", act_txt)
+                elif cmd.startswith("subkelvin:"):
+                    val = cmd.split("subkelvin:")[1].strip().lower() in ("true", "1", "yes")
+                    self.btn_subkelvin_filter.setChecked(val)
+                    self.toggle_subkelvin_filter()
+                elif cmd == "snapshot":
+                    self.export_plot_snapshot(bypass_popup=True)
                 elif cmd.startswith("theme:"):
                     new_theme = cmd.split("theme:")[1].strip()
                     if new_theme in ("light", "dark"):
                         self.theme = new_theme
                         self.apply_theme()
+                elif cmd.startswith("toggle_heatswitch:"):
+                    hs_key = cmd.split("toggle_heatswitch:")[1].strip().lower()
+                    lbl = {"pot": "Pot", "adr": "ADR", "charcoal": "Charcoal"}.get(hs_key, hs_key.upper())
+                    self.on_heatswitch_clicked(hs_key, lbl, bypass_confirm=True)
+                elif cmd.startswith("click_heatswitch:"):
+                    hs_key = cmd.split("click_heatswitch:")[1].strip().lower()
+                    lbl = {"pot": "Pot", "adr": "ADR", "charcoal": "Charcoal"}.get(hs_key, hs_key.upper())
+                    self.on_heatswitch_clicked(hs_key, lbl, bypass_confirm=False)
+                elif cmd.startswith("set_heatswitch:"):
+                    parts = cmd.split("set_heatswitch:")[1].strip().split(":")
+                    if len(parts) == 2:
+                        hs_key = parts[0].strip().lower()
+                        val = parts[1].strip().upper()
+                        if val in ("OPEN", "CLOSED"):
+                            self.set_heatswitch_state(hs_key, val)
         except Exception as e:
             print(f"Error handling external command: {e}")
 
@@ -1724,9 +2432,73 @@ Categories=Science;Utility;
 
         disp_name = state_label(target_state)
         if not bypass_confirm:
-            reply = QMessageBox.question(self, 'Confirm Procedure',
-                                         f'Switch to procedure: {disp_name}?',
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if target_state in ("he3_adr_cycle", "he3_only_cycle"):
+                mag_I = abs(getattr(self, "_latest_magnet_current", 0.0))
+                if mag_I > 0.2:
+                    QMessageBox.critical(
+                        self,
+                        f"🛑 Cannot Start {disp_name}",
+                        f"Magnet current is currently elevated at {mag_I:.3f} A!\n\n"
+                        f"Starting the {disp_name} requires the magnet to be completely de-energized.\n\n"
+                        "Please run 'Ramp Down Magnet' first to safely de-energize the magnet.",
+                        QMessageBox.Ok
+                    )
+                    return
+                cycle_desc = (
+                    "Current procedure will verify Pot < 3.2 K, heat charcoal to 55 K, "
+                    "condense He-3 (3.5 h), and cool charcoal to reach ~300 mK without touching the magnet."
+                    if target_state == "he3_only_cycle" else
+                    "Current procedure will verify Pot < 3.2 K, heat charcoal to 55 K, "
+                    "ramp ADR to full field, condense He-3 (3.5 h), and demag."
+                )
+                reply = QMessageBox.question(
+                    self,
+                    f"⚠️ Pre-Flight Check: {disp_name}",
+                    f"Please verify before starting:\n\n"
+                    f"1. Is the GREEN He-3 valve on the cryostat CLOSED?\n"
+                    f"2. {cycle_desc}\n\n"
+                    "Has the green valve been closed and are you ready to proceed?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+            elif target_state == "ramp_down_magnet":
+                cur_I = abs(getattr(self, "_latest_magnet_current", 0.0))
+                reply = QMessageBox.question(
+                    self,
+                    "Confirm Magnet Ramp-Down",
+                    f"Current magnet current is {cur_I:.3f} A.\n\n"
+                    "This will safely ramp the Lake Shore 370 magnet output from its current "
+                    "setting down to 0% at the standard controlled rate.\n\n"
+                    "Do you want to begin ramp-down?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+            elif target_state == "warmup_300K":
+                mag_I = abs(getattr(self, "_latest_magnet_current", 0.0))
+                if mag_I > 0.2:
+                    QMessageBox.critical(
+                        self,
+                        "🛑 Cannot Start Warm Up to 300 K",
+                        f"DANGER: Magnet is energized with current at {mag_I:.3f} A!\n\n"
+                        "Warming the cryostat while the magnet is energized will trigger a violent "
+                        "magnet quench as soon as the superconducting coils warm above ~9 K.\n\n"
+                        "Please run 'Ramp Down Magnet' first to safely de-energize the magnet.",
+                        QMessageBox.Ok
+                    )
+                    return
+                reply = QMessageBox.warning(
+                    self,
+                    "⚠️ Confirm Cryostat Warm-Up to 300 K",
+                    "WARNING: You are about to initiate Warm Up to 300 K!\n\n"
+                    "1. Ensure the GREEN He-3 valve on the cryostat is OPEN so expanding gas "
+                    "can vent safely into the room-temperature storage tank.\n"
+                    "2. This will apply heat and warm the entire cryostat to 295 K, "
+                    "which takes several hours and requires a complete cooldown cycle to recover.\n\n"
+                    "Are you absolutely sure you want to proceed?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+            else:
+                reply = QMessageBox.question(self, 'Confirm Procedure',
+                                             f'Switch to procedure: {disp_name}?',
+                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply != QMessageBox.Yes:
                 return
 
@@ -1822,11 +2594,43 @@ Categories=Science;Utility;
 
     def stop_state(self, bypass_confirm=False):
         if not bypass_confirm:
-            reply = QMessageBox.question(self, 'Confirm Stop',
-                                         'Stop current procedure and switch to Idle?',
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply != QMessageBox.Yes:
-                return
+            current = abs(getattr(self, "_latest_magnet_current", 0.0))
+            if current > 0.2:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle("⚠️ Elevated Magnet Current Warning")
+                box.setText(
+                    f"Magnet current is currently elevated at {current:.3f} A!\n\n"
+                    "Stopping the procedure now will leave the magnet energized.\n"
+                    "What would you like to do?"
+                )
+                btn_ramp = box.addButton("Ramp Down Safely", QMessageBox.AcceptRole)
+                btn_hold = box.addButton("Hold Current & Idle", QMessageBox.DestructiveRole)
+                btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+                box.setDefaultButton(btn_ramp)
+                box.exec_()
+                clicked = box.clickedButton()
+                if clicked == btn_cancel:
+                    return
+                elif clicked == btn_ramp:
+                    self.previewing_state = None
+                    self.dismiss_operator_banner()
+                    idx = self.combo_box.findData("ramp_down_magnet")
+                    if idx >= 0:
+                        self.combo_box.blockSignals(True)
+                        self.combo_box.setCurrentIndex(idx)
+                        self.combo_box.blockSignals(False)
+                    self.data_thread.set_combo_value("ramp_down_magnet")
+                    self._set_status_badge("RUNNING", "running")
+                    self.lbl_script_name.setText(f"Active Script: {state_label('ramp_down_magnet')}")
+                    return
+                # If btn_hold was clicked, proceed to idle below
+            else:
+                reply = QMessageBox.question(self, 'Confirm Stop',
+                                             'Stop current procedure and switch to Idle?',
+                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply != QMessageBox.Yes:
+                    return
         self.previewing_state = None
         self.dismiss_operator_banner()
         idx = self.combo_box.findData(IDLE_STATE)
@@ -1853,13 +2657,26 @@ Categories=Science;Utility;
         self.update_plot()
 
     def on_time_window_changed(self, text):
-        tw_map = {
-            "1 Hour": "Last 1 Hour",
-            "6 Hours": "Last 6 Hours",
-            "24 Hours": "Last 24 Hours",
-            "All Time": "All Time",
-        }
-        self.time_window = tw_map.get(text, "Last 6 Hours")
+        norm = "6 Hours"
+        t_low = str(text).lower()
+        if "1" in t_low and "24" not in t_low:
+            norm = "1 Hour"
+        elif "6" in t_low:
+            norm = "6 Hours"
+        elif "24" in t_low:
+            norm = "24 Hours"
+        elif "7" in t_low or "week" in t_low:
+            norm = "7 Days"
+        elif "all" in t_low:
+            norm = "7 Days"
+
+        self.time_window = norm
+        self.gui_settings["default_range"] = norm
+        save_gui_settings(self.gui_settings)
+        if hasattr(self, "combo_default_range") and self.combo_default_range.currentText() != norm:
+            self.combo_default_range.blockSignals(True)
+            self.combo_default_range.setCurrentText(norm)
+            self.combo_default_range.blockSignals(False)
         self.user_has_zoomed = False
         self.update_plot()
 
@@ -1870,6 +2687,7 @@ Categories=Science;Utility;
         self.update_plot()
 
     def _on_plot_timer(self):
+        self.sync_heatswitch_states_from_hardware()
         if self._drag_active:
             return
         if not self.displaying_historical:
@@ -2071,6 +2889,15 @@ Categories=Science;Utility;
         if isinstance(val, (int, float)):
             if np.isnan(val):
                 return f"{alias}: NaN"
+            if "vac" in key.lower() or "torr" in str(unit).lower() or "torr" in key.lower():
+                if val < 0.1:
+                    return f"{alias}: {val*1000.0:.2f} mTorr"
+                elif val < 10.0:
+                    return f"{alias}: {val:.3f} Torr"
+                else:
+                    return f"{alias}: {val:.2f} Torr"
+            if "temp" in key.lower() or str(unit).upper() == "K":
+                return f"{alias}: {format_cryo_temp(val)}"
             return f"{alias}: {val:.3f} {unit}".strip()
         return f"{alias}: {val}"
 
@@ -2078,6 +2905,68 @@ Categories=Science;Utility;
         if not data_mr:
             self.lbl_latest_vals.setText("LATEST  Waiting for telemetry...")
             return
+
+        is_light = (self.theme == "light")
+        key_fallbacks = {
+            "cryocon_chB_temperature": ["cryocon_chB_temperature", "chB_temperature", "chB", "charcoal"],
+            "cryocon_chC_temperature": ["cryocon_chC_temperature", "chC_temperature", "chC", "4k_flange", "4k"],
+            "cryocon_chD_temperature": ["cryocon_chD_temperature", "chD_temperature", "chD", "pot"],
+            "cryocon_chA_temperature": ["cryocon_chA_temperature", "chA_temperature", "chA", "40k_flange", "40k"],
+            "faa_temperature": ["faa_temperature", "faa"],
+            "labjack_he3_pressure": ["labjack_he3_pressure", "he3_pressure"],
+            "labjack_kepco_current": ["labjack_kepco_current", "kepco_current"],
+        }
+        for key, spec in self.metric_tiles.items():
+            raw_val = None
+            for candidate in key_fallbacks.get(key, [key]):
+                if candidate in data_mr:
+                    raw_val = data_mr[candidate]
+                    break
+            if raw_val is not None:
+                val = float(raw_val) if isinstance(raw_val, (int, float)) and np.isfinite(raw_val) else None
+
+                if key in ("faa_temperature", "cryocon_chD_temperature", "cryocon_chC_temperature", "cryocon_chB_temperature"):
+                    if val is not None:
+                        spec["val"].setText(format_cryo_temp(val))
+                    else:
+                        spec["val"].setText("NaN")
+                elif key == "labjack_he3_pressure":
+                    if val is not None:
+                        spec["val"].setText(f"{val:.2f} bar")
+                    else:
+                        spec["val"].setText("—")
+                elif key == "labjack_kepco_current":
+                    if val is not None:
+                        spec["val"].setText(f"{val:.3f} A")
+                        self._latest_magnet_current = val
+                    else:
+                        spec["val"].setText("0.000 A")
+                        self._latest_magnet_current = 0.0
+
+                # Visual watchdogs and solid theme styling
+                acc = spec["accent"]
+                card_style = None
+                val_style = None
+
+                if key == "labjack_he3_pressure" and val is not None and val > 9.5:
+                    card_style = "QFrame#metric_tile { background-color: #991b1b; border: 2px solid #ef4444; border-radius: 6px; }"
+                    val_style = "color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;"
+                elif key == "labjack_he3_pressure" and val is not None and val > 9.0:
+                    card_style = "QFrame#metric_tile { background-color: #b45309; border: 2px solid #f59e0b; border-radius: 6px; }"
+                    val_style = "color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;"
+                elif key == "labjack_kepco_current" and val is not None and abs(val) > 0.5:
+                    card_style = f"QFrame#metric_tile {{ background-color: {acc}; border: 2px solid #38bdf8; border-radius: 6px; }}"
+                    val_style = "color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;"
+                else:
+                    card_style = f"QFrame#metric_tile {{ background-color: {acc}; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.18); }}"
+                    val_style = "color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;"
+
+                if card_style:
+                    spec["card"].setStyleSheet(card_style)
+                if val_style:
+                    spec["val"].setStyleSheet(val_style)
+                if "lbl_t" in spec:
+                    spec["lbl_t"].setStyleSheet("color: rgba(255, 255, 255, 0.92); font-weight: 700; font-size: 11px; background: transparent;")
 
         shown_keys = [k for k in PRIMARY_STATUS_KEYS if k in data_mr]
         other_keys = [k for k in keys if k in data_mr and k not in PRIMARY_STATUS_KEYS and k not in ("time", "elapsed_time")]
@@ -2135,6 +3024,33 @@ Categories=Science;Utility;
         disp_title = state_label(running_state)
         self.setWindowTitle(f"2pac gui — {disp_title}")
 
+        # Update procedure phase progress widget
+        phase_name = getattr(self.world, "current_phase", "Holding steady")
+        step = getattr(self.world, "phase_step", 1)
+        tot_steps = getattr(self.world, "total_steps", 1)
+
+        if running_state == IDLE_STATE or not running_state:
+            self.lbl_phase_name.setText("Idle — Holding Steady")
+            self.lbl_phase_time.setText("Standing by")
+            self.phase_progress_bar.setValue(100)
+        else:
+            self.lbl_phase_name.setText(f"Step {step}/{tot_steps}: {phase_name}")
+            rem_s = getattr(self.world, "to_wait_for_process_line", 0.0)
+            wait_dur = getattr(self.world, "wait_duration_s", 0.0)
+            if rem_s > 0 and wait_dur > 0:
+                pct = int(max(0, min(100, ((wait_dur - rem_s) / wait_dur) * 100)))
+                if rem_s >= 3600:
+                    time_str = f"Remaining: {int(rem_s // 3600)}h {int((rem_s % 3600) // 60)}m"
+                elif rem_s >= 60:
+                    time_str = f"Remaining: {int(rem_s // 60)}m {int(rem_s % 60)}s"
+                else:
+                    time_str = f"Remaining: {int(rem_s)}s"
+                self.lbl_phase_time.setText(time_str)
+                self.phase_progress_bar.setValue(pct)
+            else:
+                self.lbl_phase_time.setText("Active step executing...")
+                self.phase_progress_bar.setValue(int((step / max(1, tot_steps)) * 100))
+
         if self.previewing_state is None or self.previewing_state == running_state:
             self.previewing_state = None
             if running_state in self.states_dict:
@@ -2165,7 +3081,7 @@ Categories=Science;Utility;
         active_tw = "All Time" if (self.user_has_zoomed or self.displaying_historical) else self.time_window
         result = plot_dataset(self.figure, dataset, xloc_for_vals, filter_tab=self.active_plot_tab,
                               temp_scale=self.temp_scale, time_window=active_tw, theme=self.theme,
-                              custom_xlim=saved_xlim)
+                              custom_xlim=saved_xlim, hidden_channels=self.hidden_channels)
         data_mr, data_xloc, units, keys, self.axes_list = result
 
         if self.axes_list:

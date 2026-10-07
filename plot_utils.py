@@ -3,7 +3,10 @@ import numpy as np
 import matplotlib.colors as mc
 import colorsys
 from datetime import datetime
-from matplotlib.ticker import FuncFormatter, FormatStrFormatter, MultipleLocator, Locator, Formatter
+from matplotlib.ticker import (
+    FuncFormatter, FormatStrFormatter, MultipleLocator, MaxNLocator,
+    Locator, Formatter, LogLocator, LogFormatterMathtext
+)
 from matplotlib.gridspec import GridSpec
 
 def adjust_lightness(color, amount=0.5):
@@ -33,6 +36,7 @@ TAB_GROUPS = {
     ],
     "Pressures": [
         "labjack_he3_pressure",
+        "vac_can_pressure_torr",
     ],
     "Utils": [
         "labjack_kepco_current",
@@ -64,12 +68,13 @@ THEMES = {
         "legend_edge": "#334155",
         "legend_text": "#f8fafc",
         "channel_colors": {
-            "cryocon_chA_temperature": "#38bdf8",     # Bright Cyan Blue (4K)
-            "cryocon_chB_temperature": "#fbbf24",     # Amber Gold (Charcoal)
-            "cryocon_chC_temperature": "#34d399",     # Emerald Green (Pot)
-            "cryocon_chD_temperature": "#c084fc",     # Bright Purple (ChD)
+            "cryocon_chA_temperature": "#38bdf8",     # Bright Cyan Blue (40K flange)
+            "cryocon_chB_temperature": "#34d399",     # Emerald Green (Charcoal)
+            "cryocon_chC_temperature": "#fbbf24",     # Amber Gold (4K flange)
+            "cryocon_chD_temperature": "#c084fc",     # Bright Purple (Pot)
             "faa_temperature": "#f87171",             # Crimson Rose (FAA)
             "labjack_he3_pressure": "#60a5fa",        # Royal Blue (He3 Pressure)
+            "vac_can_pressure_torr": "#2dd4bf",       # Bright Teal (Vac Can Pressure)
             "labjack_kepco_current": "#38bdf8",       # Bright Cyan (Kepco I)
             "labjack_kepco_voltage": "#f59e0b",       # Amber Yellow (Kepco V)
             "ls370_heater_out": "#f472b6",            # Neon Pink (LS370 Heater)
@@ -93,12 +98,13 @@ THEMES = {
         "legend_edge": "#cbd5e1",
         "legend_text": "#0f172a",
         "channel_colors": {
-            "cryocon_chA_temperature": "#0284c7",     # Deep Sky Blue (4K)
-            "cryocon_chB_temperature": "#d97706",     # Warm Amber / Bronze (Charcoal)
-            "cryocon_chC_temperature": "#059669",     # Forest / Emerald Green (Pot)
-            "cryocon_chD_temperature": "#7c3aed",     # Vivid Purple (ChD)
+            "cryocon_chA_temperature": "#0284c7",     # Deep Sky Blue (40K flange)
+            "cryocon_chB_temperature": "#059669",     # Forest / Emerald Green (Charcoal)
+            "cryocon_chC_temperature": "#d97706",     # Warm Amber / Bronze (4K flange)
+            "cryocon_chD_temperature": "#7c3aed",     # Vivid Purple (Pot)
             "faa_temperature": "#dc2626",             # Crimson Red (FAA)
             "labjack_he3_pressure": "#2563eb",        # Deep Royal Blue (He3 Pressure)
+            "vac_can_pressure_torr": "#0d9488",       # Teal (Vac Can Pressure)
             "labjack_kepco_current": "#0891b2",       # Deep Cyan (Kepco I)
             "labjack_kepco_voltage": "#d97706",       # Amber (Kepco V)
             "ls370_heater_out": "#db2777",            # Deep Magenta / Pink (LS370 Heater)
@@ -117,12 +123,13 @@ DARK_CHANNEL_COLORS = THEMES["dark"]["channel_colors"]
 
 # Default channel aliases — updated by the Settings tab
 CHANNEL_ALIASES = {
-    "cryocon_chA_temperature": "4K",
+    "cryocon_chA_temperature": "40K flange",
     "cryocon_chB_temperature": "Charcoal",
-    "cryocon_chC_temperature": "Pot",
-    "cryocon_chD_temperature": "ChD",
+    "cryocon_chC_temperature": "4K flange",
+    "cryocon_chD_temperature": "Pot",
     "faa_temperature": "FAA",
     "labjack_he3_pressure": "He3 Pressure",
+    "vac_can_pressure_torr": "Vac Can Pressure",
     "labjack_kepco_current": "Magnet Current",
     "labjack_kepco_voltage": "Kepco V",
     "ls370_heater_out": "LS370 Heater",
@@ -488,9 +495,18 @@ def get_pressure_key(data):
         return "labjack_he3_pressure"
     for k in data.keys():
         if k not in ("time", "elapsed_time", "state") and ("pressure" in k.lower() or "pres" in k.lower()):
-            if k in data[k] and len(data[k][k]) > 0:
+            if "vac" not in k.lower() and k in data[k] and len(data[k][k]) > 0:
                 return k
     return "labjack_he3_pressure"
+
+def get_vac_can_pressure_key(data):
+    for k in ("vac_can_pressure_torr", "labjack_vac_can_pressure_torr", "vac_can_pressure", "vac_can"):
+        if k in data and k in data[k] and len(data[k][k]) > 0:
+            return k
+    for k in data.keys():
+        if "vac" in k.lower() and "pres" in k.lower() and k in data[k] and len(data[k][k]) > 0:
+            return k
+    return "vac_can_pressure_torr"
 
 def get_kepco_i_key(data):
     if "labjack_kepco_current" in data and "labjack_kepco_current" in data["labjack_kepco_current"] and len(data["labjack_kepco_current"]["labjack_kepco_current"]) > 0:
@@ -542,7 +558,26 @@ def safe_plot(ax, x, v, **kwargs):
         
     return ax.plot(x_sub, v_sub, **kwargs)
 
-def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale="log", time_window="All Time", theme="light", custom_xlim=None):
+def format_cryo_temp(val):
+    """
+    Format temperature into human-readable cryogenic units:
+    - Below 1.0 K: auto-scale to mK (e.g. 48.5 mK)
+    - 1.0 K to 10.0 K: 3 decimal places (e.g. 1.245 K)
+    - Above 10.0 K: 1 decimal place (e.g. 26.8 K)
+    """
+    if val is None or not np.isfinite(val):
+        return "NaN"
+    if val < 0.001:
+        return f"{val * 1e6:.1f} µK"
+    elif val < 1.0:
+        return f"{val * 1000.0:.1f} mK"
+    elif val < 10.0:
+        return f"{val:.3f} K"
+    else:
+        return f"{val:.1f} K"
+
+def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale="log",
+                 time_window="All Time", theme="light", custom_xlim=None, hidden_channels=None):
     """
     Plot dataset on figure with modern light or dark mode styling.
     - Main tab: All temperatures on left; He3 Pressure and Magnet Current as a 2x1 stack on right.
@@ -553,6 +588,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
     Supports time_window: "Last 1 Hour", "Last 6 Hours", "Last 24 Hours", "All Time".
     Supports theme: "light" or "dark".
     Supports custom_xlim: Optional (xmin, xmax) tuple to enforce explicit viewport zoom.
+    Supports hidden_channels: Optional set/list of channel keys to hide from the plot.
     Returns (data_mr, data_xloc, units, keys_to_plot, axes_list).
     """
     thm = THEMES.get(theme, THEMES["light"])
@@ -588,12 +624,19 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
 
     # Determine time window xlims
     window_s = None
-    if time_window in ("1 Hour", "Last 1 Hour"):
+    tw_str = str(time_window).strip().lower()
+    if "1" in tw_str and "hour" in tw_str and "24" not in tw_str:
         window_s = 3600
-    elif time_window in ("6 Hours", "Last 6 Hours"):
+    elif "6" in tw_str and "hour" in tw_str:
         window_s = 21600
-    elif time_window in ("24 Hours", "Last 24 Hours"):
+    elif "7" in tw_str or "week" in tw_str:
+        window_s = 7 * 86400
+    elif "24" in tw_str or "day" in tw_str:
         window_s = 86400
+    elif "all" in tw_str:
+        window_s = None
+    else:
+        window_s = 21600
 
     target_xlim = None
     if custom_xlim is not None and isinstance(custom_xlim, (tuple, list)) and len(custom_xlim) == 2:
@@ -666,7 +709,8 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
 
         # 1. Plot all Temperatures on ax_temp
-        temp_keys = get_temp_keys(data)
+        all_found_temps = get_temp_keys(data)
+        temp_keys = [k for k in all_found_temps if not (hidden_channels and k in hidden_channels)]
         all_temp_vals = []
         for key in temp_keys:
             if key in data and key in data[key] and len(data[key][key]) > 0:
@@ -758,7 +802,8 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         ax.grid(True, which="both", axis="both", color=thm["grid"], linestyle="--", alpha=thm["grid_alpha"])
         ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
 
-        temp_keys = get_temp_keys(data)
+        all_found_temps = get_temp_keys(data)
+        temp_keys = [k for k in all_found_temps if not (hidden_channels and k in hidden_channels)]
         all_temp_vals = []
         for key in temp_keys:
             if key in data and key in data[key] and len(data[key][key]) > 0:
@@ -809,46 +854,83 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         return (data_mr, data_xloc, units, temp_keys, axes_list)
 
     elif filter_tab in ("Pressures", "Pressure"):
-        figure.subplots_adjust(left=0.06, right=0.98, top=0.95, bottom=0.09)
-        ax = figure.add_subplot(1, 1, 1)
-        axes_list = [ax]
-        ax.set_facecolor(thm["ax_bg"])
-        for spine in ax.spines.values():
-            spine.set_color(thm["spine"])
-            spine.set_linewidth(1.0)
-        ax.grid(True, which="both", axis="both", color=thm["grid"], linestyle="--", alpha=thm["grid_alpha"])
-        ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
-        ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+        figure.subplots_adjust(left=0.06, right=0.98, top=0.95, bottom=0.09, hspace=0.18)
+        ax1 = figure.add_subplot(2, 1, 1)
+        ax2 = figure.add_subplot(2, 1, 2, sharex=ax1)
+        axes_list = [ax1, ax2]
 
-        key = get_pressure_key(data)
-        color = ch_colors.get(key, "#2563eb")
-        name = display_name(key)
-        if key in data and key in data[key] and len(data[key][key]) > 0:
-            v = np.array(data[key][key], dtype=float)
-            v_plot = get_sliced(v)
-            safe_plot(ax, x_plot, v_plot, color=color, lw=1.8)
-        ax.set_title(name, loc="left", fontsize=10, fontweight="bold", color=color, pad=4)
-        ax.set_ylabel("Pressure (bar)", color=thm["tick_color"], fontsize=9, fontweight="bold")
+        for ax in (ax1, ax2):
+            ax.set_facecolor(thm["ax_bg"])
+            for spine in ax.spines.values():
+                spine.set_color(thm["spine"])
+                spine.set_linewidth(1.0)
+            ax.grid(True, which="both", axis="both", color=thm["grid"], linestyle="--", alpha=thm["grid_alpha"])
+            ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
 
-        ax.xaxis.set_major_locator(SmartTimeLocator())
-        ax.xaxis.set_major_formatter(SmartTimeFormatter())
-        ax.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
-        ax.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
+        # 1. He3 Pressure (Top)
+        he3_key = get_pressure_key(data)
+        color_he3 = ch_colors.get(he3_key, "#2563eb")
+        name_he3 = display_name(he3_key)
+        ax1.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+        if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
+            v_he3 = np.array(data[he3_key][he3_key], dtype=float)
+            v_he3_plot = get_sliced(v_he3)
+            safe_plot(ax1, x_plot, v_he3_plot, color=color_he3, lw=1.8)
+        ax1.set_title(name_he3, loc="left", fontsize=9.5, fontweight="bold", color=color_he3, pad=3)
+        ax1.set_ylabel("Pressure (bar)", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
+        ax1.tick_params(axis="x", labelbottom=False)
+
+        # 2. Vacuum Can Pressure (Bottom)
+        vac_key = get_vac_can_pressure_key(data)
+        color_vac = ch_colors.get(vac_key, "#0d9488")
+        name_vac = display_name(vac_key)
+        ax2.set_yscale("log")
+        has_vac = False
+        if vac_key in data and vac_key in data[vac_key] and len(data[vac_key][vac_key]) > 0:
+            v_vac = np.array(data[vac_key][vac_key], dtype=float)
+            v_vac_plot = get_sliced(v_vac)
+            valid_mask = np.isfinite(v_vac_plot) & (v_vac_plot > 0)
+            if np.any(valid_mask):
+                has_vac = True
+                safe_plot(ax2, x_plot, v_vac_plot, color=color_vac, lw=1.8)
+                y_min_val = float(np.min(v_vac_plot[valid_mask]))
+                y_max_val = float(np.max(v_vac_plot[valid_mask]))
+                if y_max_val / max(1e-9, y_min_val) < 10.0:
+                    log_mid = (np.log10(y_min_val) + np.log10(y_max_val)) / 2.0
+                    ax2.set_ylim(bottom=10.0 ** (np.floor(log_mid) - 1.0), top=10.0 ** (np.ceil(log_mid) + 1.0))
+                else:
+                    ax2.set_ylim(bottom=10.0 ** np.floor(np.log10(y_min_val)), top=10.0 ** np.ceil(np.log10(y_max_val)))
+
+        if not has_vac:
+            ax2.set_ylim(bottom=1e-4, top=1e3)
+
+        ax2.yaxis.set_major_locator(LogLocator(base=10.0))
+        ax2.yaxis.set_major_formatter(LogFormatterMathtext())
+        ax2.set_title(name_vac, loc="left", fontsize=9.5, fontweight="bold", color=color_vac, pad=3)
+        ax2.set_ylabel("Vac Can (Torr)", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
+        ax2.xaxis.set_major_locator(SmartTimeLocator())
+        ax2.xaxis.set_major_formatter(SmartTimeFormatter())
+        ax2.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
+        ax2.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
+        try:
+            figure.align_ylabels(axes_list)
+        except Exception:
+            pass
 
         if target_xlim is not None:
-            ax.set_xlim(target_xlim)
+            ax1.set_xlim(target_xlim)
 
         if data_xloc is not None and xloc_ind is not None:
-            ax.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
+            ax1.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
+            ax2.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
 
-        return (data_mr, data_xloc, units, [key], axes_list)
+        return (data_mr, data_xloc, units, [he3_key, vac_key], axes_list)
 
     else:  # "Utils" / "Diagnostics"
-        figure.subplots_adjust(left=0.06, right=0.98, top=0.95, bottom=0.09, hspace=0.15)
+        figure.subplots_adjust(left=0.06, right=0.98, top=0.95, bottom=0.09, hspace=0.18)
         channel_list = [
             "labjack_kepco_voltage",
             "ls370_heater_out",
-            "heat_switches",
         ]
         first_ax = None
         for idx, ch_key in enumerate(channel_list):
@@ -869,46 +951,16 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
             ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
 
-            if ch_key == "heat_switches":
-                base_colors = [ch_colors.get(k, "#7c3aed") for k in keys_hs]
-                for i, key in enumerate(keys_hs):
-                    if key not in data or key not in data[key]:
-                        continue
-                    if key == "labjack_relay":
-                        v_open = np.array([d == "CONTROL" for d in data[key][key]])
-                        v_closed = np.array([d == "RAMP" for d in data[key][key]])
-                        v_unknown = np.array([d == "UNKNOWN" for d in data[key][key]])
-                    else:
-                        v_open = np.array([d == "OPEN" for d in data[key][key]])
-                        v_closed = np.array([d == "CLOSED" for d in data[key][key]])
-                        v_unknown = np.array([d == "UNKNOWN" for d in data[key][key]])
-
-                    yval = (2e-2) * (0.85 ** i)
-                    y_open = get_sliced(np.where(v_open, yval, np.nan))
-                    y_closed = get_sliced(np.where(v_closed, yval, np.nan))
-                    y_unknown = get_sliced(np.where(v_unknown, yval, np.nan))
-
-                    color = base_colors[i]
-                    safe_plot(ax, x_plot, y_closed, color=color, lw=2.5, label=display_name(key))
-                    safe_plot(ax, x_plot, y_open, color=color, lw=1.5, ls=":")
-                    safe_plot(ax, x_plot, y_unknown, linestyle="--", color=color, lw=1.5)
-
-                ax.set_yscale("log")
-                ax.set_ylabel("State", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
-                ax.legend(loc="upper left", fontsize=7.5, facecolor=thm["legend_bg"], edgecolor=thm["legend_edge"], labelcolor=thm["legend_text"], framealpha=0.9)
-                ax.set_title("Heat Switches & Relay", loc="left", fontsize=9, fontweight="bold", color=thm["text"], pad=2)
-
-            else:
-                color = ch_colors.get(ch_key, "#0891b2")
-                unit = units.get(ch_key, "")
-                name = display_name(ch_key)
-                
-                if ch_key in data and ch_key in data[ch_key] and len(data[ch_key][ch_key]) > 0:
-                    v = np.array(data[ch_key][ch_key], dtype=float)
-                    v_plot = get_sliced(v)
-                    safe_plot(ax, x_plot, v_plot, color=color, linewidth=1.8)
-                ax.set_title(name, loc="left", fontsize=9.5, fontweight="bold", color=color, pad=3)
-                ax.set_ylabel(f"{name} ({unit})" if unit else name, color=thm["tick_color"], fontsize=8.5, fontweight="bold")
+            color = ch_colors.get(ch_key, "#0891b2")
+            unit = units.get(ch_key, "")
+            name = display_name(ch_key)
+            
+            if ch_key in data and ch_key in data[ch_key] and len(data[ch_key][ch_key]) > 0:
+                v = np.array(data[ch_key][ch_key], dtype=float)
+                v_plot = get_sliced(v)
+                safe_plot(ax, x_plot, v_plot, color=color, linewidth=1.8)
+            ax.set_title(name, loc="left", fontsize=9.5, fontweight="bold", color=color, pad=3)
+            ax.set_ylabel(f"{name} ({unit})" if unit else name, color=thm["tick_color"], fontsize=8.5, fontweight="bold")
 
             if data_xloc is not None and xloc_ind is not None:
                 ax.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
@@ -924,7 +976,129 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         if target_xlim is not None and first_ax is not None:
             first_ax.set_xlim(target_xlim)
 
-        keys_to_plot = [k for k in channel_list if k != "heat_switches"] + keys_hs
-        return (data_mr, data_xloc, units, keys_to_plot, axes_list)
+        return (data_mr, data_xloc, units, channel_list, axes_list)
+
+
+def export_snapshot_plot(dataset, out_path, xlim=None, run_label="Current Run"):
+    """
+    Exports an 8-panel (2x4) publication-style snapshot figure matching the 2pac cryostat
+    reference report layout into out_path:
+      Row 0: Upper stage temp. (K), Charcoal temp. (K), 3 K plate temp. (K), ³He pot temp (K)
+      Row 1: FAA temp (K), ³He pressure (abs. bar), Magnet current (A), Magnet setpoint (%)
+    Top x-axis on Row 0: Time elapsed (hr)
+    Bottom x-axis on Row 1: Time elapsed (ks)
+    Only plots current dataset data within the specified xlim window.
+    """
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    data = dataset.cache.data()
+    t = get_time_vector(dataset, data)
+    if t is None or len(t) == 0:
+        raise ValueError("No telemetry time vector found in dataset.")
+
+    if xlim is not None and isinstance(xlim, (tuple, list)) and len(xlim) == 2:
+        x_min_ts, x_max_ts = float(xlim[0]), float(xlim[1])
+    else:
+        x_min_ts, x_max_ts = float(t[0]), float(t[-1])
+
+    if x_min_ts >= x_max_ts:
+        x_min_ts, x_max_ts = float(t[0]), float(t[-1])
+
+    mask = (t >= x_min_ts) & (t <= x_max_ts)
+    if not np.any(mask):
+        mask = np.ones(len(t), dtype=bool)
+
+    t_sub = t[mask]
+
+    # Elapsed time is measured from the beginning of the plot window, not the beginning of the file
+    t0_plot = max(x_min_ts, float(t[0]))
+    t_hr = (t_sub - t0_plot) / 3600.0
+    x_min_hr = 0.0
+    x_max_hr = max(0.05, (x_max_ts - t0_plot) / 3600.0)
+
+    t_min_dt = datetime.fromtimestamp(t0_plot).strftime("%Y-%m-%d %H:%M")
+    t_max_dt = datetime.fromtimestamp(x_max_ts).strftime("%Y-%m-%d %H:%M")
+
+    channel_map = [
+        ("Upper stage (40K) temp. (K)", ["cryocon_chA_temperature", "chA", "40k"]),
+        ("Charcoal temp. (K)", ["cryocon_chB_temperature", "chB", "charcoal"]),
+        ("4 K flange temp. (K)", ["cryocon_chC_temperature", "chC", "4k", "3k"]),
+        ("³He pot temp (K)", ["cryocon_chD_temperature", "chD", "pot"]),
+        ("FAA temp (K)", ["faa_temperature", "faa"]),
+        ("³He pressure (abs. bar)", ["labjack_he3_pressure", "he3_pressure"]),
+        ("Magnet current (A)", ["labjack_kepco_current", "kepco_current"]),
+        ("Magnet setpoint (%)", ["ls370_heater_out", "labjack_kepco_voltage"]),
+    ]
+
+    fig, axes = plt.subplots(2, 4, figsize=(15, 8.2), sharex=True)
+    fig.patch.set_facecolor("white")
+
+    for idx, (label, candidates) in enumerate(channel_map):
+        row = idx // 4
+        col = idx % 4
+        ax = axes[row, col]
+        ax.set_facecolor("white")
+
+        y_raw = None
+        for c in candidates:
+            if c in data and c in data[c] and len(data[c][c]) > 0:
+                y_raw = np.array(data[c][c], dtype=float)[mask]
+                break
+        if y_raw is None:
+            y_raw = np.zeros_like(t_sub)
+
+        ax.plot(t_hr, y_raw, color="#00aa00", lw=2.0, label=run_label)
+        ax.set_ylabel(label, fontsize=9.5, fontweight="bold", color="black")
+        ax.grid(True, linestyle=":", color="#cccccc", alpha=0.8)
+
+        for spine in ax.spines.values():
+            spine.set_color("black")
+            spine.set_linewidth(1.1)
+        ax.tick_params(direction="in", top=True, right=True, which="both", colors="black", labelsize=8.5)
+        ax.legend(loc="upper right", frameon=True, edgecolor="#cccccc", facecolor="white", fontsize=8.5, framealpha=0.9)
+
+        y_valid = y_raw[np.isfinite(y_raw)]
+        if len(y_valid) > 0:
+            y_min, y_max = np.min(y_valid), np.max(y_valid)
+            if "setpoint" in label.lower() and y_min == y_max == 0:
+                ax.set_ylim(-0.05, 0.05)
+            elif y_max > y_min:
+                pad = (y_max - y_min) * 0.05
+                ax.set_ylim(y_min - pad, y_max + pad)
+            else:
+                ax.set_ylim(y_min - 0.1, y_max + 0.1)
+
+        ax.set_xlim(x_min_hr, x_max_hr)
+
+        if row == 0:
+            ax.tick_params(labelbottom=False)
+        else:
+            ax.set_xlabel("Time elapsed (hr)", fontsize=9.5, fontweight="bold", color="black", labelpad=5)
+            if x_max_hr < 0.9:
+                ax.xaxis.set_major_locator(MaxNLocator(nbins=6, steps=[1, 2, 5]))
+            else:
+                if x_max_hr <= 8.5:
+                    step = 1
+                elif x_max_hr <= 16.5:
+                    step = 2
+                elif x_max_hr <= 36.5:
+                    step = 4
+                else:
+                    step = 6
+                ax.xaxis.set_major_locator(MultipleLocator(step))
+                ax.xaxis.set_major_formatter(FormatStrFormatter("%d"))
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fig.suptitle(f"2pac ADR Cryostat Telemetry Snapshot — {now_str}   [Local Time: {t_min_dt} to {t_max_dt}]",
+                 fontsize=11, fontweight="bold", y=0.98, color="black")
+    plt.subplots_adjust(left=0.065, right=0.98, top=0.93, bottom=0.09, wspace=0.28, hspace=0.18)
+
+    out_p = Path(out_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(out_p), dpi=150, facecolor="white", edgecolor="none")
+    plt.close(fig)
+    return out_p
+
 
 

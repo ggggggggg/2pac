@@ -30,8 +30,15 @@ class World:
     target_tick_rate_s: float = 1.0
     state_start_time: float = field(default=0.0, init=False)
     to_wait_for_process_line: float = 0.0
-    # def wait(self, seconds):
-    #     self.waiting_for = self.time.time() + seconds
+    current_phase: str = "Holding steady"
+    phase_step: int = 1
+    total_steps: int = 1
+    wait_duration_s: float = 0.0
+
+    def set_phase(self, phase_name: str, step: int = 1, total_steps: int = 1):
+        self.current_phase = str(phase_name)
+        self.phase_step = int(step)
+        self.total_steps = int(total_steps)
 
     # do not overload
     def _update(self, state):
@@ -142,7 +149,8 @@ class World:
 
 
     def wait(self, seconds):
-        self.command=WaitUntil(time_s = time.time()+seconds)
+        self.wait_duration_s = float(seconds)
+        self.command = WaitUntil(time_s=time.time() + seconds)
 
     def wait_for_input(self, target_input):
         self.command=WaitForInput(target_input)

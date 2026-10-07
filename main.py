@@ -10,41 +10,65 @@ def _patched_sqlite3_connect(database, **kwargs):
     return _orig_sqlite3_connect(database, **kwargs)
 sqlite3.connect = _patched_sqlite3_connect
 from PyQt5.QtWidgets import QApplication, QSplashScreen
-from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont, QIcon
+from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont, QIcon, QPainterPath
 from PyQt5.QtCore import Qt, QRectF, QTimer
 
-def create_splash_pixmap():
-    pixmap = QPixmap(440, 200)
+def create_splash_pixmap(icon_path=None):
+    if icon_path is None:
+        icon_path = Path(__file__).parent / "adr_gui_icon.png"
+
+    width = 380
+    height = 420
+    pixmap = QPixmap(width, height)
     pixmap.fill(QColor("#090d16"))
     
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform)
     
     # Outer Border
     painter.setPen(QColor("#334155"))
-    painter.drawRect(0, 0, 439, 199)
+    painter.drawRect(0, 0, width - 1, height - 1)
     
     # Inner Card Background
     painter.setBrush(QColor("#111827"))
-    painter.drawRoundedRect(10, 10, 419, 179, 6, 6)
+    painter.drawRoundedRect(10, 10, width - 20, height - 20, 10, 10)
     
-    # Header Accent line
-    painter.setPen(Qt.NoPen)
-    painter.setBrush(QColor("#38bdf8"))
-    painter.drawRoundedRect(25, 25, 390, 4, 2, 2)
+    # 2PAC ADR Icon Container
+    icon_size = 200
+    ix = (width - icon_size) // 2
+    iy = 32
+    if Path(icon_path).exists():
+        path = QPainterPath()
+        path.addRoundedRect(ix, iy, icon_size, icon_size, 16, 16)
+        painter.save()
+        painter.setClipPath(path)
+        icon_pix = QPixmap(str(icon_path)).scaled(icon_size, icon_size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        painter.drawPixmap(ix, iy, icon_pix)
+        painter.restore()
+
+        # Rounded Accent Border around Icon
+        painter.setPen(QColor("#38bdf8"))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(ix, iy, icon_size, icon_size, 16, 16)
     
-    # Title Text
-    painter.setPen(QColor("#38bdf8"))
-    title_font = QFont("Inter", 22, QFont.Bold)
+    # Title Text: 2PAC GUI
+    painter.setPen(QColor("#f8fafc"))
+    title_font = QFont("Inter", 24, QFont.Bold)
     title_font.setStyleHint(QFont.SansSerif)
     painter.setFont(title_font)
-    painter.drawText(QRectF(20, 45, 400, 45), Qt.AlignCenter, "2pac gui")
+    painter.drawText(QRectF(10, 255, width - 20, 42), Qt.AlignCenter, "2PAC GUI")
+    
+    # Cyan Accent Bar
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor("#38bdf8"))
+    painter.drawRoundedRect(width // 2 - 35, 305, 70, 3, 1, 1)
     
     # Subtitle Text
     painter.setPen(QColor("#94a3b8"))
     sub_font = QFont("Inter", 11)
     painter.setFont(sub_font)
-    painter.drawText(QRectF(20, 100, 400, 30), Qt.AlignCenter, "Starting telemetry & hardware drivers...")
+    painter.drawText(QRectF(10, 325, width - 20, 30), Qt.AlignCenter, "Starting telemetry & hardware drivers...")
     
     painter.end()
     return pixmap
@@ -61,8 +85,8 @@ def main():
         app.setWindowIcon(QIcon(str(icon_path)))
     app.setStyle('Fusion')
     
-    # 2. Show Splash Screen with "2pac gui"
-    splash_pix = create_splash_pixmap()
+    # 2. Show Splash Screen with 2PAC ADR Icon & "2PAC GUI"
+    splash_pix = create_splash_pixmap(icon_path)
     splash = QSplashScreen(splash_pix, Qt.WindowStaysOnTopHint)
     if icon_path.exists():
         splash.setWindowIcon(QIcon(str(icon_path)))
@@ -79,23 +103,9 @@ def main():
     start_all_logging()
     app.processEvents()
     
-    # 3. Setup Database
-    import qcodes
-    from qcodes import initialise_or_create_database_at, load_or_create_experiment, Measurement
-    from qcodes.parameters import ElapsedTimeParameter
-    from datetime import datetime
-    
-    today = datetime.now().strftime("%Y-%m-%d")
-    db_dir = Path.home() / "2pac_logs" / today
-    db_dir.mkdir(parents=True, exist_ok=True)
-    db_file_path = db_dir / "2pac.db"
-    initialise_or_create_database_at(str(db_file_path))
-    app.processEvents()
-    
-    exp = load_or_create_experiment(
-        experiment_name='running 2pac adr',
-        sample_name="no sample"
-    )
+    # 3. Setup Daily Continuous Logging (Partitioned by Day, no fragmented runs)
+    from daily_logger import DailyLogManager
+    daily_logger = DailyLogManager()
     app.processEvents()
 
     # 4. Connect Hardware Drivers while keeping Qt responsive
@@ -107,76 +117,63 @@ def main():
     states.st = st
     app.processEvents()
 
+    from qcodes.parameters import ElapsedTimeParameter
     elapsed_time = ElapsedTimeParameter('elapsed_time')
     states.elapsed_time = elapsed_time
 
-    meas = Measurement(exp=exp, name='adr run', station=st)
-    meas.register_parameter(elapsed_time)
-    meas.register_parameter(st.cryocon.chA_temperature, setpoints=[elapsed_time])
-    meas.register_parameter(st.cryocon.chB_temperature, setpoints=[elapsed_time])
-    meas.register_parameter(st.cryocon.chC_temperature, setpoints=[elapsed_time])
-    meas.register_parameter(st.cryocon.chD_temperature, setpoints=[elapsed_time])
-    meas.register_parameter(st.labjack.kepco_current, setpoints=[elapsed_time])
-    meas.register_parameter(st.labjack.kepco_voltage)
-    meas.register_parameter(st.ls370.heater.out, setpoints=[elapsed_time])
-    meas.register_parameter(st.labjack.relay, paramtype="text")
-    meas.register_parameter(st.labjack.heatswitch_adr, paramtype="text")
-    meas.register_parameter(st.labjack.heatswitch_charcoal, paramtype="text")
-    meas.register_parameter(st.labjack.heatswitch_pot, paramtype="text")
-    meas.register_parameter(st.labjack.he3_pressure, setpoints=[elapsed_time])
-    meas.register_custom_parameter("state", paramtype="text")
-    meas.register_custom_parameter("faa_temperature", unit="K", setpoints=[elapsed_time])
-    meas.register_custom_parameter("time", unit="s")
-    app.processEvents()
-
     desktop_states = load_all_desktop_scripts()
-    states.STATES_DICT.update(desktop_states)
+    for k, v in desktop_states.items():
+        if k not in states.STATES_DICT:
+            states.STATES_DICT[k] = v
     app.processEvents()
 
     from gui import MyApp
 
-    # Start in wait_forever writing data continuously
-    with meas.run() as datasaver:
-        world = states.StationWorld(station=st)
-        states.datasaver_global = datasaver
-        world.datasaver = datasaver
+    world = states.StationWorld(station=st)
+    states.datasaver_global = daily_logger
+    world.datasaver = daily_logger
 
-        world._update(states.wait_forever)
-        dataset = datasaver.dataset
+    world._update(states.wait_forever)
+    dataset = daily_logger.dataset
 
-        window = MyApp(world, dataset, states.STATES_DICT)
-        if icon_path.exists():
-            window.setWindowIcon(QIcon(str(icon_path)))
-        window.show()
+    window = MyApp(world, dataset, states.STATES_DICT, daily_logger=daily_logger)
+    if icon_path.exists():
+        window.setWindowIcon(QIcon(str(icon_path)))
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    splash.finish(window)
+
+    # Force window to foreground in X11 / GNOME Mutter over existing active windows (e.g. VSCode)
+    def bring_to_front():
+        window.setWindowState((window.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
         window.raise_()
         window.activateWindow()
-        splash.finish(window)
+        try:
+            import Xlib.display, Xlib.X, Xlib.protocol.event
+            d = Xlib.display.Display()
+            root = d.screen().root
+            net_active = d.intern_atom('_NET_ACTIVE_WINDOW')
+            ev = Xlib.protocol.event.ClientMessage(
+                window=int(window.winId()),
+                client_type=net_active,
+                data=(32, [2, Xlib.X.CurrentTime, 0, 0, 0])
+            )
+            root.send_event(ev, event_mask=Xlib.X.SubstructureRedirectMask | Xlib.X.SubstructureNotifyMask)
+            d.sync()
+        except Exception:
+            pass
 
-        # Force window to foreground in X11 / GNOME Mutter over existing active windows (e.g. VSCode)
-        def bring_to_front():
-            window.setWindowState((window.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
-            window.raise_()
-            window.activateWindow()
-            try:
-                import Xlib.display, Xlib.X, Xlib.protocol.event
-                d = Xlib.display.Display()
-                root = d.screen().root
-                net_active = d.intern_atom('_NET_ACTIVE_WINDOW')
-                ev = Xlib.protocol.event.ClientMessage(
-                    window=int(window.winId()),
-                    client_type=net_active,
-                    data=(32, [2, Xlib.X.CurrentTime, 0, 0, 0])
-                )
-                root.send_event(ev, event_mask=Xlib.X.SubstructureRedirectMask | Xlib.X.SubstructureNotifyMask)
-                d.sync()
-            except Exception:
-                pass
+    bring_to_front()
+    QTimer.singleShot(100, bring_to_front)
+    QTimer.singleShot(350, bring_to_front)
 
-        bring_to_front()
-        QTimer.singleShot(100, bring_to_front)
-        QTimer.singleShot(350, bring_to_front)
-
-        sys.exit(app.exec_())
+    ret = app.exec_()
+    try:
+        daily_logger.close()
+    except Exception:
+        pass
+    sys.exit(ret)
 
 if __name__ == "__main__":
     main()
