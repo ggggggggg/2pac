@@ -12,8 +12,24 @@
 
 ---
 
-### 2. He-3 Only Cycle (`he3_only_cycle`)
-- **Purpose**: Condenses $^3\text{He}$ to achieve base $\sim 300\text{ mK}$ cooling without energizing the superconducting magnet. Used by experiments requiring zero magnetic field.
+### 2. Auto-Cool: He-3 + ADR (`autocool_he3_adr`)
+- **Purpose**: Fully autonomous 300 K to base run combining `ready_for_cooldown` and `he3_adr_cycle` into a single unattended sequence with pressure-gated safety interlocks.
+- **Phases**:
+  1. **Pre-cooling Setup**: Closes all heat switches (Pot, ADR, Charcoal) to couple stages to the 4 K cold head. Sets Cryo-con Loop 1 (45 K) and Loop 2 (55 K) with heaters disabled.
+  2. **He-3 Pressure Drop to 0 bar (~24h from pulse tube startup)**:
+     - As the sorption pump and pot cool, He-3 cryopumps into the system and pressure drops from room temperature positive pressure to 0 bar.
+     - When $P_{He3} \le 0.10\text{ bar}$ (~24 h into cooldown), the script displays a prominent high-contrast banner in the GUI:
+       `⚠️ ACTION REQUIRED: He-3 pressure has dropped to 0 bar (~24h into cooldown). CLOSE the GREEN He-3 valve on the cryostat now, then click 'Confirm Step Done'.`
+     - **Mandatory Safety Pause**: The procedure strictly halts and will not proceed until the operator closes the green valve and acknowledges the message by clicking `Confirm Step Done`.
+  3. **Cooldown Completion (~29h from pulse tube startup)**:
+     - Once confirmed, continues adaptive slow polling (60s/30s/10s) until 3K stage (Ch C) drops below 3.2 K, without flooding the serial bus.
+  4. **Autonomous Execution**:
+     - Settles 30 s and seamlessly launches the full He-3 + ADR sequence (heats charcoal to 55 K, ramps magnet to 9.50 A, dwells 3.5 h, cools charcoal to launch temp, demagnetizes, and hands off to closed-loop temperature regulation).
+
+---
+
+### 3. He-3 Only Cycle (`he3_only_cycle`)
+- **Purpose**: Condenses $^3\text{He}$ to achieve base $\sim 350\text{ mK}$ cooling without energizing the superconducting magnet.
 - **Phases**:
   1. **Pre-flight**: Checks that the green He-3 valve is closed and magnet current is zero.
   2. **Heat Charcoal & Isolate Pot**:
@@ -27,11 +43,11 @@
      - Pot Heat Switch: **OPEN**
      - Charcoal Heat Switch: **CLOSED** (to pump on $^3\text{He}$)
      - Duration: $\sim 60\text{ min}$.
-  4. **Base Temperature**: Base $\sim 300\text{ mK}$ holding steady. Returns to `wait_forever` (Idle).
+  4. **Base Temperature**: Base $\sim 350\text{ mK}$ holding steady. Returns to `wait_forever` (Idle).
 
 ---
 
-### 3. Full He-3 + ADR Cycle (`he3_adr_cycle`)
+### 4. Full He-3 + ADR Cycle (`he3_adr_cycle`)
 - **Purpose**: Full cycle combining $^3\text{He}$ condensation and ADR magnetic cooling to reach $\sim 50\text{ mK}$.
 - **Phases**:
   1. Pre-flight valve check and magnet de-energize guard.
@@ -44,7 +60,7 @@
 
 ---
 
-### 4. Warm Up to 300 K (`warmup_300K`)
+### 5. Warm Up to 300 K (`warmup_300K`)
 - **Purpose**: Controlled system warm-up from cryogenic temperatures back to room temperature.
 - **Safety Interlock**: Rejects starting if magnet current is $> 0.2\text{ A}$ to prevent quenching or thermal runaway.
 - **Configuration**:
@@ -53,7 +69,7 @@
 
 ---
 
-### 5. Ramp Down Magnet (`ramp_down_magnet`)
+### 6. Ramp Down Magnet (`ramp_down_magnet`)
 - **Purpose**: Standalone procedure to safely de-energize the superconducting magnet to zero current if a cycle was interrupted or paused.
 - **Behavior**: Smoothly ramps current down over up to 30 minutes at a safe rate.
 

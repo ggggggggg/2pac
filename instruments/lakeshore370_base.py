@@ -329,10 +329,30 @@ class LakeshoreBase(VisaInstrument):
         if print_connect_message:
             self.connect_message()
 
+    # Minimum spacing between serial transactions. The LS370 misses a query sent ~10 ms after a write
+    # (HTR? right after MOUT timed out on every ramp tick, POST_CYCLE_FIXES P0-1), so every transaction
+    # waits until at least this long after the previous one finished. All threads share _io_lock.
+    MIN_GAP_AFTER_WRITE_S = 0.15
+    MIN_GAP_AFTER_QUERY_S = 0.05
+    _io_ready_at = 0.0
+
+    def _wait_for_bus(self) -> None:
+        dt = self._io_ready_at - time.monotonic()
+        if dt > 0:
+            time.sleep(dt)
+
     def write_raw(self, cmd: str) -> None:
         with self._io_lock:
-            super().write_raw(cmd)
+            self._wait_for_bus()
+            try:
+                super().write_raw(cmd)
+            finally:
+                self._io_ready_at = time.monotonic() + self.MIN_GAP_AFTER_WRITE_S
 
     def ask_raw(self, cmd: str) -> str:
         with self._io_lock:
-            return super().ask_raw(cmd)
+            self._wait_for_bus()
+            try:
+                return super().ask_raw(cmd)
+            finally:
+                self._io_ready_at = time.monotonic() + self.MIN_GAP_AFTER_QUERY_S

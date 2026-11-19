@@ -10,12 +10,13 @@ wait 1 s
 close heatswitch charcoal
 wait 30 s
 
-# Pre-cooling check: wait until 3K starting temp < 3.2K
+# Pre-cooling check: wait until 3K starting temp < 3.2K (adaptive slow polling)
 while True:
     mr = most_recent_measurements()
-    if mr.get("cryocon_chC_temperature", 100) < 3.2:
+    c_temp = mr.get("cryocon_chC_temperature", 100)
+    if c_temp < 3.2:
         break
-    world.wait(1)
+    world.wait(60 if c_temp > 20 else (30 if c_temp > 5 else 10))
 
 # 2. Switch relay to RAMP and ensure current starts from zero
 set relay RAMP

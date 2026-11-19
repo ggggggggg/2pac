@@ -47,6 +47,30 @@ class World:
     phase_step: int = 1
     total_steps: int = 1
     wait_duration_s: float = 0.0
+    operator_action_required: bool = False
+    operator_action_confirmed: bool = False
+    operator_action_message: str = ""
+
+    def request_operator_action(self, message: str):
+        """Prompt operator for an action and mark that acknowledgment is required."""
+        self.operator_action_required = True
+        self.operator_action_confirmed = False
+        self.operator_action_message = str(message)
+        print(f"\n{'='*70}\n⚠️ OPERATOR ACTION REQUIRED:\n{message}\n{'='*70}\n")
+        if hasattr(self, "_data_thread") and self._data_thread is not None:
+            state_name = getattr(self._data_thread.state, "name", lambda: "procedure")()
+            self._data_thread.operator_action.emit(state_name, message)
+
+    def confirm_operator_action(self):
+        """Called when operator acknowledges the banner in the GUI."""
+        self.operator_action_confirmed = True
+        self.operator_action_required = False
+        self.operator_action_message = ""
+        print("✔ Operator action confirmed.")
+
+    def is_operator_action_confirmed(self) -> bool:
+        """Returns True if operator has confirmed the required action."""
+        return self.operator_action_confirmed
 
     def set_phase(self, phase_name: str, step: int = 1, total_steps: int = 1):
         self.current_phase = str(phase_name)
@@ -95,7 +119,12 @@ class World:
                 self._update(state)
             try: 
                 if should_run_line:
-                    line_number = state_gen.send(None)
+                    self._step_seq += 1
+                    self._in_state_step = True
+                    try:
+                        line_number = state_gen.send(None)
+                    finally:
+                        self._in_state_step = False
                 yield state, line_number
             except StopIteration as e:
                 next_state = e.value
@@ -133,10 +162,12 @@ class World:
                 return should_update, should_process_line
 
             to_wait_for_tick_s = self.next_tick_target_time_s() - self.time.time()
-            # Enforce positive sleep to avoid spin-locking CPU
-            sleep_duration = min(self.to_wait_for_process_line, max(0.1, to_wait_for_tick_s))
+            # Sleep at least 0.1 s (a 0.01 s floor made the LS370 HTR? read land ~10 ms after each MOUT
+            # write during ramps, so it timed out every tick: POST_CYCLE_FIXES P0-1). Cap at 0.5 s so the
+            # thread stays responsive to GUI aborts/pauses.
+            sleep_duration = min(self.to_wait_for_process_line, max(0.1, to_wait_for_tick_s), 0.5)
             self.time.sleep(sleep_duration)
-            should_update = True
+            should_update = (self.next_tick_target_time_s() - self.time.time() <= 0)
             should_process_line = False
             return should_update, should_process_line
 
@@ -161,7 +192,23 @@ class World:
         return False, True
 
 
+    # Guard state for wait() (see wait()). Plain class attributes so dataclass fields stay unchanged.
+    _step_seq = 0
+    _wait_seq = -1
+    _in_state_step = False
+    strict_wait = True
+
     def wait(self, seconds):
+        """
+        Schedule a wait. It only takes effect at the next `yield`, i.e. after the current line of the
+        running @state body. Raises if called twice in one step: that means a loop calling wait() inside
+        a plain helper function (no yields), which spins forever, stops telemetry and can't be aborted
+        (the 2026-11-16 pre-cool deadlock). Put such loops in the @state body instead.
+        """
+        if self.strict_wait and self._in_state_step and self._wait_seq == self._step_seq:
+            raise RuntimeError("world.wait() called twice without yielding: wait loops must live in the "
+                               "@state body, not in a helper function (see docs/POST_CYCLE_FIXES.md P1-1).")
+        self._wait_seq = self._step_seq
         self.wait_duration_s = float(seconds)
         self.command = WaitUntil(time_s=self.time.time() + float(seconds))
 

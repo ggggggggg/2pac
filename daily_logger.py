@@ -517,11 +517,11 @@ class DailyLogManager:
     def _preload_recent_history(self, cutoff_time: Optional[float] = None):
         """
         Preloads telemetry from preceding days asynchronously in background
-        so rolling time windows ('Last 6 Hours', 'Last 24 Hours', and multi-day cooldowns)
+        so rolling time windows ('1 Hour', '6 Hours', '1 Day', '1 Week', '1 Month', and multi-day cooldowns)
         span seamlessly across midnight boundaries without blocking application launch.
         """
         if cutoff_time is None:
-            cutoff_time = time.time() - (8 * 86400)  # past 8 days (covers 7 full days)
+            cutoff_time = time.time() - (35 * 86400)  # past 35 days (covers 1 full month)
 
         days_to_check = []
         try:
@@ -529,7 +529,7 @@ class DailyLogManager:
         except Exception:
             today_dt = datetime.now()
 
-        for d in range(8, 0, -1):
+        for d in range(35, 0, -1):
             day_str = (today_dt - timedelta(days=d)).strftime("%Y-%m-%d")
             db_p = self.base_dir / day_str / "2pac.db"
             if db_p.exists():
@@ -622,8 +622,8 @@ class DailyLogManager:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_time ON telemetry(time)")
         self.conn.commit()
 
-        # 4. Prune points older than 8 days from cache
-        cutoff = time.time() - (8 * 86400)
+        # 4. Prune points older than 35 days from cache
+        cutoff = time.time() - (35 * 86400)
         with self._lock:
             times = self.dataset.cache.get_column("time")
             if len(times) > 0:

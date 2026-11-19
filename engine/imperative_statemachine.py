@@ -1,3 +1,5 @@
+import ast
+import textwrap
 from dataclasses import dataclass, field
 import inspect
 from typing import Callable, Union
@@ -21,7 +23,87 @@ def collect_exits(source: str) -> list[str]:
                 exits.append(None)  # Append None to indicate a bare return
     return exits  # Return the list of exit states
 
+_NO_YIELD_AFTER = (ast.Return, ast.Raise, ast.Break, ast.Continue, ast.Pass)
+_COMPOUND = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)
+
+
+class _YieldInserter(ast.NodeTransformer):
+    """
+    Insert `yield <line index>` after every statement of the state function body (recursively into
+    if/for/while/with/try blocks), and at the start of every block (so loop iterations always yield).
+
+    The yielded value is the 0-based line index of the statement's first line in the source, which
+    is what State.code_line/code_highlighted expect. Works on statement nodes, so multi-line statements
+    (wrapped call arguments, long strings) are fine.
+    Nested function/class definitions are left untouched (a yield would turn them into generators).
+    """
+
+    def _with_yields(self, stmts, header_lineno=None):
+        out = []
+        if header_lineno is not None:
+            out.append(_yield_stmt(header_lineno))
+        for s in stmts:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.append(s)
+                continue
+            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str):
+                out.append(s)  # docstring / bare string
+                continue
+            if isinstance(s, _COMPOUND):
+                self._transform_compound(s)
+            out.append(s)
+            if not isinstance(s, _NO_YIELD_AFTER):
+                out.append(_yield_stmt(s.lineno))
+        return out
+
+    def _transform_compound(self, node):
+        if isinstance(node, ast.Try):
+            node.body = self._with_yields(node.body, node.lineno)
+            for h in node.handlers:
+                h.body = self._with_yields(h.body, h.lineno)
+            if node.orelse:
+                node.orelse = self._with_yields(node.orelse)
+            if node.finalbody:
+                node.finalbody = self._with_yields(node.finalbody)
+            return
+        node.body = self._with_yields(node.body, node.lineno)
+        if getattr(node, "orelse", None):
+            node.orelse = self._with_yields(node.orelse)
+
+    def transform_function(self, fn):
+        fn.body = self._with_yields(fn.body)
+        # Guarantee the function is a generator even if no yield was inserted (e.g. only `return x`).
+        fn.body.append(ast.If(test=ast.Constant(value=False), body=[_yield_stmt(fn.lineno)], orelse=[]))
+        return fn
+
+
+def _yield_stmt(lineno):
+    return ast.Expr(value=ast.Yield(value=ast.Constant(value=int(lineno) - 1)))
+
+
 def insert_line_number_yields(source: str) -> str:
+    """
+    AST-based transform (2026-11-18): returns Python source of the function(s) in `source` with a
+    `yield <line index>` after every statement. Replaces the old line-based text transform, which
+    broke on multi-line statements (SyntaxError at import).
+    """
+    tree = ast.parse(textwrap.dedent(source))
+    inserter = _YieldInserter()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            inserter.transform_function(node)
+    tree = ast.fix_missing_locations(tree)
+    # Keep original line numbers on the yields so tracebacks still point near the right line.
+    return _unparse_preserving_lines(tree)
+
+
+def _unparse_preserving_lines(tree) -> str:
+    """ast.unparse loses line numbers; that's fine for exec. Callers that need tracebacks use the raw source."""
+    return ast.unparse(tree)
+
+
+def insert_line_number_yields_legacy(source: str) -> str:
+    """Old line-based transform, kept for reference. Breaks on multi-line statements."""
     new_source = ""
     i = 0
     n_leading_whitespace = 0

@@ -47,6 +47,32 @@ TAB_GROUPS = {
     ],
 }
 
+# Wiring-resistance correction for the Kepco voltage (POST_CYCLE_FIXES P1-13). The GUI sets these
+# from the Utils tab (Wiring R boxes) and the cached relay position. Kepco V = I*R_wiring + L*dI/dt, so
+# V - I*R_wiring leaves only the inductive part. No correction when the relay position is unknown.
+WIRING_R_OHM = {"RAMP": 0.120, "CONTROL": 12.0}
+ACTIVE_RELAY = None
+DERIVED_INDUCTIVE_KEY = "magnet_inductive_voltage"
+
+
+def add_derived_channels(data):
+    """Return a shallow copy of a dataset cache dict with derived channels added (never mutates the cache)."""
+    if ACTIVE_RELAY not in WIRING_R_OHM:
+        return data
+    vk, ik = "labjack_kepco_voltage", "labjack_kepco_current"
+    try:
+        v = np.asarray(data[vk][vk], dtype=float)
+        i = np.asarray(data[ik][ik], dtype=float)
+    except Exception:
+        return data
+    n = min(len(v), len(i))
+    if n == 0:
+        return data
+    out = dict(data)
+    out[DERIVED_INDUCTIVE_KEY] = {DERIVED_INDUCTIVE_KEY: v[:n] - i[:n] * float(WIRING_R_OHM[ACTIVE_RELAY])}
+    return out
+
+
 TAB_YLABELS = {
     "Main": "Overview",
     "Thermometers": "Temperature (K)",
@@ -594,7 +620,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
     - Pressures tab: 1 full-sized subplot.
     - Utils tab: Subplots for Kepco V, LS370 Heater, Heat Switches & Relay.
     Supports temp_scale: "log" or "linear".
-    Supports time_window: "Last 1 Hour", "Last 6 Hours", "Last 24 Hours", "All Time".
+    Supports time_window: "1 Hour", "6 Hours", "1 Day", "1 Week", "1 Month", "All Time".
     Supports theme: "light" or "dark".
     Supports custom_xlim: Optional (xmin, xmax) tuple to enforce explicit viewport zoom.
     Supports hidden_channels: Optional set/list of channel keys to hide from the plot.
@@ -618,6 +644,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             t = get_time_vector(dataset, data)
             if t is not None:
                 x = t
+            data = add_derived_channels(data)
         except Exception as e:
             print(f"Dataset access error: {e}")
 
@@ -641,14 +668,16 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
     # Determine time window xlims
     window_s = None
     tw_str = str(time_window).strip().lower()
-    if "1" in tw_str and "hour" in tw_str and "24" not in tw_str:
+    if "month" in tw_str or "30" in tw_str:
+        window_s = 30 * 86400
+    elif "week" in tw_str or "7" in tw_str:
+        window_s = 7 * 86400
+    elif "day" in tw_str or "24" in tw_str:
+        window_s = 86400
+    elif "1" in tw_str and "hour" in tw_str:
         window_s = 3600
     elif "6" in tw_str and "hour" in tw_str:
         window_s = 21600
-    elif "7" in tw_str or "week" in tw_str:
-        window_s = 7 * 86400
-    elif "24" in tw_str or "day" in tw_str:
-        window_s = 86400
     elif "all" in tw_str:
         window_s = None
     else:
@@ -711,6 +740,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         and cache.get("temp_scale") == temp_scale
         and cache.get("hidden_set") == hidden_set
         and cache.get("temp_keys") == tuple(temp_keys)
+        and cache.get("derived_sig") == (ACTIVE_RELAY, tuple(sorted(WIRING_R_OHM.items())))
         and all(ax in figure.axes for ax in cache.get("axes", []))
     )
 
@@ -906,6 +936,14 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
 
         else:  # "Utils" / "Diagnostics"
             channel_list = ["labjack_kepco_voltage", "ls370_heater_out"]
+            ind_line = lines_dict.get(DERIVED_INDUCTIVE_KEY)
+            if ind_line is not None:
+                dk = DERIVED_INDUCTIVE_KEY
+                if dk in data and len(data[dk][dk]) > 0:
+                    xp_i, vp_i = get_plot_arrays(x_plot, get_sliced(np.asarray(data[dk][dk], dtype=float)))
+                    ind_line.set_data(xp_i, vp_i)
+                else:
+                    ind_line.set_data([], [])
             for idx, ch_key in enumerate(channel_list):
                 if ch_key in lines_dict and idx < len(axes_list):
                     line = lines_dict[ch_key]
@@ -916,6 +954,9 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
                         line.set_data(xp, vp)
                         if custom_xlim is None:
                             val_pos = vp[np.isfinite(vp)]
+                            if idx == 0 and ind_line is not None:
+                                yi = np.asarray(ind_line.get_ydata(), dtype=float)
+                                val_pos = np.concatenate([val_pos, yi[np.isfinite(yi)]])
                             if len(val_pos) > 0:
                                 v_min, v_max = float(np.min(val_pos)), float(np.max(val_pos))
                                 pad = max(0.05, (v_max - v_min) * 0.05)
@@ -1071,6 +1112,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             "temp_scale": temp_scale,
             "hidden_set": hidden_set,
             "temp_keys": tuple(temp_keys),
+            "derived_sig": (ACTIVE_RELAY, tuple(sorted(WIRING_R_OHM.items()))),
             "lines": lines_dict,
             "crosshairs": crosshairs,
             "axes": axes_list,
@@ -1159,6 +1201,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             "temp_scale": temp_scale,
             "hidden_set": hidden_set,
             "temp_keys": tuple(temp_keys),
+            "derived_sig": (ACTIVE_RELAY, tuple(sorted(WIRING_R_OHM.items()))),
             "lines": lines_dict,
             "crosshairs": crosshairs,
             "axes": axes_list,
@@ -1261,6 +1304,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             "temp_scale": temp_scale,
             "hidden_set": hidden_set,
             "temp_keys": tuple(temp_keys),
+            "derived_sig": (ACTIVE_RELAY, tuple(sorted(WIRING_R_OHM.items()))),
             "lines": lines_dict,
             "crosshairs": crosshairs,
             "axes": axes_list,
@@ -1321,6 +1365,14 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             else:
                 ax.tick_params(axis="x", which="both", labelbottom=False)
 
+        dk = DERIVED_INDUCTIVE_KEY
+        if axes_list and dk in data and len(data[dk][dk]) > 0:
+            xp_i, vp_i = get_plot_arrays(x_plot, get_sliced(np.asarray(data[dk][dk], dtype=float)))
+            ind_line, = axes_list[0].plot(xp_i, vp_i, color="#7c3aed", linewidth=1.2, alpha=0.9,
+                                          label=f"Inductive V = V - I*R ({ACTIVE_RELAY}, R={WIRING_R_OHM.get(ACTIVE_RELAY, 0):g} Ohm)")
+            lines_dict[dk] = ind_line
+            axes_list[0].legend(loc="upper right", fontsize=7.5, framealpha=0.6)
+
         if target_xlim is not None and first_ax is not None:
             first_ax.set_xlim(target_xlim)
 
@@ -1336,6 +1388,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             "temp_scale": temp_scale,
             "hidden_set": hidden_set,
             "temp_keys": tuple(temp_keys),
+            "derived_sig": (ACTIVE_RELAY, tuple(sorted(WIRING_R_OHM.items()))),
             "lines": lines_dict,
             "crosshairs": crosshairs,
             "axes": axes_list,

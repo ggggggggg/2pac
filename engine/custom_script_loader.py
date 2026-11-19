@@ -149,8 +149,28 @@ def load_all_desktop_scripts() -> dict[str, State]:
     custom_states = {}
     for p in sorted(DESKTOP_SCRIPTS_DIR.glob("*.txt")):
         try:
+            reason = magnet_script_refusal(p.read_text(encoding="utf-8"))
+            if reason:
+                print(f"Refusing desktop script {p.name}: {reason}")
+                continue
             name, st_obj = load_state_from_txt(p)
             custom_states[name] = st_obj
         except Exception as e:
             print(f"Error loading desktop script {p.name}: {e}")
     return custom_states
+
+
+# Desktop scripts are free-form copies; the magnet/relay procedures in states.py carry safety checks
+# (CSET limit, ramp-tracking guard, zero-current relay switching) that copies silently lack
+# (POST_CYCLE_FIXES P1-8). So desktop scripts may not drive the magnet or the relay.
+_MAGNET_PATTERNS = ("heater.out(", "ramp_controller", ".relay(", "set relay", "MOUT", "HTRRNG", "heater.range(", "heater.mode(")
+
+
+def magnet_script_refusal(text: str):
+    """Return a reason string if a desktop script drives the magnet / relay, else None."""
+    code_lines = [ln.split("#", 1)[0] for ln in text.splitlines()]
+    hits = sorted({pat for pat in _MAGNET_PATTERNS for ln in code_lines if pat in ln})
+    if hits:
+        return (f"it drives the magnet/relay ({', '.join(hits)}). Use the built-in procedures "
+                "(He-3 + ADR cycle, Ramp Down Magnet, Regulate) which include the safety checks.")
+    return None

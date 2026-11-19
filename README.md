@@ -236,7 +236,7 @@ Supported pseudocode commands:
   - Scroll over the **Y-axis** to zoom in/out in temperature or pressure.
 - **Right-Click Drag**: Pan viewport across the timeline.
 - **Reset Zoom**: Instantly restores the full view for the active time window.
-- **Time Range Selector**: Quickly switch between `15 Mins`, `1 Hour`, `6 Hours`, `1 Day`, or `All Time`.
+- **Time Range Selector**: Quickly switch between `1 Hour`, `6 Hours`, `1 Day`, `1 Week`, or `1 Month`.
 - **Theme Toggle**: Switch between clean **Light Mode** and high-contrast **Dark Mode**.
 
 ---
@@ -330,7 +330,9 @@ Each line contains: `<epoch_timestamp> <value>\n`.
 ├── docs/                       # Detailed documentation
 │   ├── ARCHITECTURE.md         # Software architecture and subsystem breakdown
 │   ├── PROCEDURES.md           # Operational procedure guides and safety rules
-│   └── KEPCO_SHUNT_AND_PID_NOTES.md # Kepco 100 Ohm shunt resistor & PID notes
+│   ├── KEPCO_SHUNT_AND_PID_NOTES.md # Kepco 100 Ohm shunt resistor & PID notes
+│   ├── PID_TUNING_LIBRARY.md   # Lake Shore 370 PID parameter library & benchmarks
+│   └── MAINTENANCE_AND_HISTORY.md # Hardware maintenance log & software modernization history
 │
 └── older/                      # Archived legacy implementations (historical reference)
     ├── README.md               # Summary of archived legacy code

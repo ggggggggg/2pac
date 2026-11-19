@@ -44,6 +44,30 @@ class World:
     phase_step: int = 1
     total_steps: int = 1
     wait_duration_s: float = 0.0
+    operator_action_required: bool = False
+    operator_action_confirmed: bool = False
+    operator_action_message: str = ""
+
+    def request_operator_action(self, message: str):
+        """Prompt operator for an action and mark that acknowledgment is required."""
+        self.operator_action_required = True
+        self.operator_action_confirmed = False
+        self.operator_action_message = str(message)
+        print(f"\n{'='*70}\n⚠️ OPERATOR ACTION REQUIRED:\n{message}\n{'='*70}\n")
+        if hasattr(self, "_data_thread") and self._data_thread is not None:
+            state_name = getattr(self._data_thread.state, "name", lambda: "procedure")()
+            self._data_thread.operator_action.emit(state_name, message)
+
+    def confirm_operator_action(self):
+        """Called when operator acknowledges the banner in the GUI."""
+        self.operator_action_confirmed = True
+        self.operator_action_required = False
+        self.operator_action_message = ""
+        print("✔ Operator action confirmed.")
+
+    def is_operator_action_confirmed(self) -> bool:
+        """Returns True if operator has confirmed the required action."""
+        return self.operator_action_confirmed
 
     def set_phase(self, phase_name: str, step: int = 1, total_steps: int = 1):
         self.current_phase = str(phase_name)
@@ -149,8 +173,9 @@ class World:
                     return should_update, should_process_line
 
 
-        time.sleep(to_wait_for_tick_s)
-        should_update = True
+        sleep_chunk = min(max(0.01, to_wait_for_tick_s), 0.5)
+        self.time.sleep(sleep_chunk)
+        should_update = (self.next_tick_target_time_s() - self.time.time() <= 0)
         should_process_line = False
         return should_update, should_process_line        
             

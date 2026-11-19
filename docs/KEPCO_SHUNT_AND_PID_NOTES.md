@@ -44,9 +44,15 @@ The Lake Shore 370 heater output is a **programmable DC current source** ($I$), 
   * During the 60-minute ramp to $9.57\text{ A}$ ($\frac{dI}{dt} \approx 2.64\text{ mA/s}$), the inductive component $L \frac{dI}{dt}$ is tiny ($\sim 0.05\text{ V}$), and `Kepco V` remains at $\approx 1.15\text{ V}$ even after the ramp finishes ($dI/dt = 0$ at 10:20–10:34).
   * Therefore, the linear rise from $0\text{ V} \rightarrow 1.15\text{ V}$ is due to the **ohmic resistance of the room-temperature cables, feedthroughs, and magnet leads**:
     $$R_\text{leads} = \frac{1.15\text{ V}}{9.57\text{ A}} \approx \mathbf{0.12\ \Omega}$$
-* **Relay Routing (`RAMP` vs. `CONTROL`)**:
-  * **`RAMP` mode**: Routes the Lake Shore output to the Kepco programming input ($10\text{ k}\Omega$ unshunted on 2PAC, $100\ \Omega$ shunted on KPAC).
-  * **`CONTROL` mode**: Isolates the Kepco and routes the Lake Shore output to the **FAA stage heater** inside the cryostat for closed-loop PID temperature regulation.
+* **Relay Routing (`RAMP` vs. `CONTROL`)** (corrected 2026-11-18, see `POST_CYCLE_FIXES.md` §2b):
+  * The programming side is the same in both positions: LS370 heater output → [$100\ \Omega$ shunt ∥ Kepco input ~10 kΩ] → Kepco (voltage-programmed). The $100\ \Omega$ shunt has been installed on 2PAC since 2026-10-16.
+  * **`RAMP`**: Kepco output → leads (~$0.12\ \Omega$) → magnet. Sensitivity ≈ 1,606 A per A of LS370 current; magnet current lags the command with $\tau = L/R \approx 250\text{ s}$.
+  * **How the relay does it (confirmed 2026-11-18):** the $12\ \Omega$ resistor is wired **in parallel with the relay contact**. RAMP closes the contact and shorts the $12\ \Omega$; CONTROL opens it, so all current flows through $12\ \Omega$ + wiring.
+  * **`CONTROL`**: contact open, **~$12\ \Omega$ in series** with the magnet on the Kepco output side. Same programming, ~100× less magnet current (≈ 15.6 A/A), $\tau \approx 2.5\text{ s}$. Regulation works by modulating the magnet field (demag/remag), not through a separate stage heater. The Kepco is *not* isolated.
+  * A ~$10\ \Omega$ Dale resistor is permanently in parallel with the magnet.
+  * Measured V/I: RAMP 0.12 Ω (9.3 A, 1.13 V); CONTROL 11.9–12.0 Ω (0.10–0.16 A). The software now checks V/I against these after switching.
+  * ⚠️ **Never switch the relay with output applied.** The Kepco is voltage-programmed: CONTROL → RAMP with ~1 V regulation output shorts the 12 Ω and the magnet current climbs toward 1 V / 0.12 Ω ≈ 8 A (τ ≈ 250 s). RAMP → CONTROL at field opens the contact and forces the magnet current into 12 Ω / the Dale resistor (fast discharge, voltage spike). The software and the Utils relay buttons require |I| < 10 mA **and** LS370 output ≈ 0 %.
+  * The 10/16–18 "stuck relay" period = contact stayed closed (12 Ω shorted) while software logged CONTROL.
 
 
 ---
@@ -75,6 +81,8 @@ When you physically insert the $100\ \Omega$ resistor in parallel across the Kep
 | **PID Transfer from KPAC** | Did not work (impedance mismatch) | **Direct 1:1 transfer valid** | Loop transfer functions ($V/I$) are now identical |
 
 ### Choosing the Regulation Range for 50–70 mK (With $100\ \Omega$ Resistor)
+
+> ⚠️ **Superseded (2026-11-18).** The numbers in this subsection were taken 10/16–10/18 while the latching relay was most likely stuck in RAMP (software logged CONTROL). True CONTROL is ~100× (not 10×) less sensitive than RAMP. For real CONTROL use the **10 mA range with CSET limit 7, P 7, I 80 s, D 0** (~25 µK rms at 60 mK, output 50–65 %), see `PID_TUNING_LIBRARY.md`. The table below is kept for history only.
 
 In `CONTROL` mode, the relay scales the Kepco current sensitivity down by **$10\times$** compared to `RAMP` mode (today on `100uA` without the shunt, $100\% = 1.68\text{ A}$, so $70\text{ mK}$ held at $\text{Hout} \approx 4.6\%$ / $I_\text{mag} = 76\text{ mA}$, and $80\text{ mK}$ held at $\text{Hout} \approx 8.0\%$ / $I_\text{mag} = 135\text{ mA}$).
 
@@ -112,3 +120,16 @@ When you install the **$100\ \Omega$ parallel resistor**, every range shifts up 
      ```
 5. **Verify with Low Setpoint First**: Test with a small setpoint step ($1\text{ to }2\text{ mK}$ or low magnet current) to confirm stable closed-loop response before running a full cycle.
 
+---
+
+## 4. Measurements (2026-11-16/17, 100 Ω shunt, 10 mA range)
+
+| Quantity | Value | Notes |
+|---|---|---|
+| Magnet current at 58.1 % (RAMP) | 9.25–9.42 A | 59.2 % ≈ 9.5 A (`magnet_max_hout` default) |
+| Kepco output voltage at full field | 1.12–1.13 V | V/I ≈ 0.12 Ω (leads) |
+| RAMP lag (first-order) | τ ≈ 250–300 s | Ramp guard uses a lagged expectation |
+| CONTROL circuit | ≈ 12 Ω series, τ ≈ 2.5 s | ~0.1 A at 60 mK, 50–65 % on 10 mA |
+| CONTROL sensitivity | ≈ 15.6 A per A of LS370 current | 0.081 A at 5.4 mA measured |
+| Kepco V with the Kepco OFF | ≈ 0.89 V offset | don't use for V/I or wiring-R calibration |
+| LS370 `CMODE?` / `HTRRNG?` after a `CMODE 4` write | read 4 / 0 ("off"), front panel off, but the PID output keeps running | not a readback quirk (11/19): re-writing HTRRNG 6 (bumpless) and CMODE 1 (integrator reset, ~2 mK dip) restores them. Never write CMODE 4. |
